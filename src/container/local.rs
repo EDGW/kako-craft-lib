@@ -6,15 +6,16 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use crate::logging::ContainerLogger;
 
 use super::{
     AddError, Buffer, CONTAINER_FORMAT_VERSION, CONTROL_DIR, Container, ContainerMetadata,
-    ContainerWriteGuard, CopyError, EntryKey, LinkFromError, LinkInfo, RemoveError, RenameError,
-    UnlinkError, WriteError, WriterError, metadata_path,
+    ContainerWriteGuard, CopyError, EntryKey, INCOMING_LINKS_FORMAT_VERSION, LinkFromError,
+    LinkInfo, LinkMetadataMigrationError, RemoveError, RenameError, UnlinkError, WriteError,
+    WriterError, metadata_path,
 };
 
 const LINKS_FILE: &str = "links.json";
@@ -65,7 +66,7 @@ impl LocalContainer {
     pub fn path(&self) -> &Path {
         let span = container_operation_span!(self.logger, "path");
         let _entered = span.enter();
-        debug!(path = %self.path.display(), "getting container path");
+        trace!(path = %self.path.display(), "getting container path");
         &self.path
     }
 
@@ -173,28 +174,28 @@ impl Container for LocalContainer {
     fn metadata(&self) -> ContainerMetadata {
         let span = container_operation_span!(self.logger, "metadata");
         let _entered = span.enter();
-        debug!("getting container metadata");
+        trace!("getting container metadata");
         self.metadata.clone()
     }
 
     fn uid(&self) -> Result<String> {
         let span = container_operation_span!(self.logger, "uid");
         let _entered = span.enter();
-        debug!("getting container UID");
+        trace!("getting container UID");
         Ok(self.metadata.uid.clone())
     }
 
     fn logical_name(&self) -> String {
         let span = container_operation_span!(self.logger, "logical_name");
         let _entered = span.enter();
-        debug!("getting container logical name");
+        trace!("getting container logical name");
         self.metadata.logical_name.clone()
     }
 
     fn kind(&self) -> String {
         let span = container_operation_span!(self.logger, "kind");
         let _entered = span.enter();
-        debug!("getting container kind");
+        trace!("getting container kind");
         self.metadata.kind.clone()
     }
 
@@ -233,7 +234,7 @@ impl Container for LocalContainer {
         match lock_file.try_lock_exclusive() {
             Ok(()) => trace!(path = %self.lock_path().display(), "acquired file lock"),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                trace!(path = %self.lock_path().display(), "file lock is held by another writer");
+                debug!(path = %self.lock_path().display(), "file lock is held by another writer");
                 return Err(WriterError::ContainerLocked);
             }
             Err(error) => return Err(WriterError::Other(error.into())),
@@ -267,8 +268,7 @@ impl LocalContainerWriteGuard {
         if !self.links_path.exists() {
             return Ok(IncomingLinksMetadata::default());
         }
-        let links: IncomingLinksMetadata = read_json(&self.links_path)?;
-        ensure_version(links.version, &self.links_path)?;
+        let links = read_incoming_metadata(&self.links_path)?;
         let actual_count = links.links.values().map(Vec::len).sum::<usize>() as u64;
         if links.count != actual_count {
             return Err(anyhow!(
@@ -296,6 +296,39 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         self.logger.uid()
     }
 
+    fn link_snapshot(&self) -> Result<super::ContainerLinkSnapshot> {
+        let links = self.links()?;
+        let incoming = links
+            .links
+            .into_iter()
+            .flat_map(|(target_key, sources)| {
+                sources
+                    .into_iter()
+                    .map(move |source| super::IncomingLinkRecord {
+                        target_key: target_key.clone(),
+                        linker_uid: source.linker_uid,
+                        linker_key: source.linker_key,
+                    })
+            })
+            .collect();
+        Ok(super::ContainerLinkSnapshot {
+            container_uid: self.logger.uid().to_owned(),
+            container_path: self.root.clone(),
+            incoming,
+            outgoing: Vec::new(),
+        })
+    }
+
+    fn filepath(&self, key: &EntryKey) -> Result<PathBuf> {
+        self.entry_path(key)
+            .map_err(|key| anyhow!("invalid entry key: {key}"))
+    }
+
+    fn read(&self, key: &EntryKey) -> Result<Buffer> {
+        let path = self.filepath(key)?;
+        fs::read(&path).with_context(|| format!("failed to read entry {}", path.display()))
+    }
+
     fn add(&mut self, key: &EntryKey, data: Buffer) -> std::result::Result<(), AddError> {
         let span = container_operation_span!(self.logger, "add");
         let _entered = span.enter();
@@ -304,21 +337,14 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         if self.is_linked_from(key).map_err(AddError::Other)? {
             return Err(AddError::EntryExists(key.clone()));
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| AddError::Other(error.into()))?;
-        }
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
+        match write_entry_atomic(&self.root, &path, &data, false) {
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(AddError::EntryExists(key.clone()));
             }
             Err(error) => return Err(AddError::Other(error.into())),
-        };
-        if let Err(error) = file.write_all(&data) {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(AddError::Other(error.into()));
         }
+        info!(entry_key = %key, byte_count = data.len(), "added container entry");
         Ok(())
     }
 
@@ -327,10 +353,11 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         let _entered = span.enter();
         debug!(entry_key = %key, byte_count = data.len(), "writing container entry");
         let path = self.entry_path(key).map_err(WriteError::InvalidEntryKey)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| WriteError::Other(error.into()))?;
-        }
-        fs::write(&path, data).map_err(|error| WriteError::Other(error.into()))
+        let byte_count = data.len();
+        write_entry_atomic(&self.root, &path, &data, true)
+            .map_err(|error| WriteError::Other(error.into()))?;
+        info!(entry_key = %key, byte_count, "wrote container entry");
+        Ok(())
     }
 
     fn remove(&mut self, key: &EntryKey) -> std::result::Result<(), RemoveError> {
@@ -344,6 +371,7 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         match fs::remove_file(&path) {
             Ok(()) => {
                 remove_empty_parents(path.parent(), &self.root);
+                info!(entry_key = %key, "removed container entry");
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -378,6 +406,7 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         }
         fs::rename(&from_path, &to_path).map_err(|error| RenameError::Other(error.into()))?;
         remove_empty_parents(from_path.parent(), &self.root);
+        info!(from = %from, to = %to, "renamed container entry");
         Ok(())
     }
 
@@ -398,9 +427,9 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         if let Some(parent) = to_path.parent() {
             fs::create_dir_all(parent).map_err(|error| CopyError::Other(error.into()))?;
         }
-        fs::copy(&from_path, &to_path)
-            .map(|_| ())
-            .map_err(|error| CopyError::Other(error.into()))
+        fs::copy(&from_path, &to_path).map_err(|error| CopyError::Other(error.into()))?;
+        info!(from = %from, to = %to, "copied container entry");
+        Ok(())
     }
 
     fn link_from(
@@ -432,7 +461,14 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
             linker_key: linker_key.clone(),
             linker_uid: linker_uid.to_owned(),
         });
-        self.save_links(&mut links).map_err(LinkFromError::Other)
+        self.save_links(&mut links).map_err(LinkFromError::Other)?;
+        info!(
+            target_key = %target_key,
+            linker_uid,
+            linker_key = %linker_key,
+            "registered incoming link"
+        );
+        Ok(())
     }
 
     fn unlink(
@@ -459,7 +495,14 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         if incoming.is_empty() {
             links.links.remove(target_key);
         }
-        self.save_links(&mut links).map_err(UnlinkError::Other)
+        self.save_links(&mut links).map_err(UnlinkError::Other)?;
+        info!(
+            target_key = %target_key,
+            linker_uid,
+            linker_key = %linker_key,
+            "removed incoming link"
+        );
+        Ok(())
     }
 
     fn link_info(&self, key: &EntryKey) -> Result<LinkInfo> {
@@ -469,15 +512,21 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         validate_key(key).map_err(|key| anyhow!("invalid entry key: {key}"))?;
         let links = self.links()?;
         Ok(match links.links.get(key) {
-            Some(links) => LinkInfo::LinkFrom {
-                linkers: links
+            Some(links) => {
+                let mut linkers = links
                     .iter()
                     .map(|link| super::LinkSource {
                         linker_key: link.linker_key.clone(),
                         linker_uid: link.linker_uid.clone(),
                     })
-                    .collect(),
-            },
+                    .collect::<Vec<_>>();
+                linkers.sort_by(|left, right| {
+                    left.linker_uid
+                        .cmp(&right.linker_uid)
+                        .then_with(|| left.linker_key.cmp(&right.linker_key))
+                });
+                LinkInfo::LinkFrom { linkers }
+            }
             None => LinkInfo::None,
         })
     }
@@ -520,7 +569,7 @@ struct IncomingLinksMetadata {
 impl Default for IncomingLinksMetadata {
     fn default() -> Self {
         Self {
-            version: CONTAINER_FORMAT_VERSION,
+            version: INCOMING_LINKS_FORMAT_VERSION,
             count: 0,
             links: BTreeMap::new(),
         }
@@ -560,10 +609,120 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to open lock file {}", path.display()))
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    serde_json::from_reader(BufReader::new(file))
-        .with_context(|| format!("failed to parse {}", path.display()))
+fn read_incoming_metadata(path: &Path) -> Result<IncomingLinksMetadata> {
+    let value: serde_json::Value = serde_json::from_reader(BufReader::new(
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
+    ))
+    .with_context(|| format!("failed to parse {}", path.display()))?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| incoming_migration_failed(path, "metadata has no numeric version"))?
+        as u32;
+    match version {
+        INCOMING_LINKS_FORMAT_VERSION => serde_json::from_value(value)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        1 => migrate_incoming_v1(path, value),
+        version => Err(LinkMetadataMigrationError::Required {
+            path: path.to_owned(),
+            version,
+        }
+        .into()),
+    }
+}
+
+fn migrate_incoming_v1(path: &Path, value: serde_json::Value) -> Result<IncomingLinksMetadata> {
+    let links = value
+        .get("links")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| incoming_migration_failed(path, "metadata has no links object"))?;
+    let mut migrated = BTreeMap::new();
+    let mut duplicate_count = 0usize;
+    for (target_key, raw) in links {
+        let candidates = if let Some(array) = raw.as_array() {
+            array.clone()
+        } else if raw.is_object() {
+            vec![raw.clone()]
+        } else {
+            return Err(incoming_migration_failed(
+                path,
+                format!("incoming value for {target_key} is not an object or array"),
+            ));
+        };
+        let mut sources = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for candidate in candidates {
+            let source: IncomingLink = serde_json::from_value(candidate).map_err(|error| {
+                incoming_migration_failed(
+                    path,
+                    format!("invalid incoming record for {target_key}: {error}"),
+                )
+            })?;
+            if seen.insert((source.linker_uid.clone(), source.linker_key.clone())) {
+                sources.push(source);
+            } else {
+                duplicate_count += 1;
+            }
+        }
+        if !sources.is_empty() {
+            migrated.insert(target_key.clone(), sources);
+        }
+    }
+    let count = migrated.values().map(Vec::len).sum::<usize>() as u64;
+    let metadata = IncomingLinksMetadata {
+        version: INCOMING_LINKS_FORMAT_VERSION,
+        count,
+        links: migrated,
+    };
+    backup_incoming_v1(path)?;
+    write_json_atomic(path, &metadata).map_err(|error| {
+        incoming_migration_failed(path, format!("failed to write v2 metadata: {error:#}"))
+    })?;
+    info!(
+        path = %path.display(),
+        link_count = count,
+        duplicate_count,
+        "migrated incoming link metadata to v2"
+    );
+    Ok(metadata)
+}
+
+fn incoming_migration_failed(path: &Path, reason: impl Into<String>) -> anyhow::Error {
+    LinkMetadataMigrationError::Failed {
+        path: path.to_owned(),
+        reason: reason.into(),
+    }
+    .into()
+}
+
+fn backup_incoming_v1(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| incoming_migration_failed(path, "metadata path has no file name"))?;
+    let backup = path.with_file_name(format!("{}.v1.backup", file_name.to_string_lossy()));
+    if backup.exists() && !backup.is_file() {
+        return Err(incoming_migration_failed(
+            path,
+            format!("backup path is not a file: {}", backup.display()),
+        ));
+    }
+    if !backup.exists() {
+        fs::copy(path, &backup).map_err(|error| {
+            incoming_migration_failed(
+                path,
+                format!("failed to create backup {}: {error}", backup.display()),
+            )
+        })?;
+        File::open(&backup)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                incoming_migration_failed(
+                    path,
+                    format!("failed to sync backup {}: {error}", backup.display()),
+                )
+            })?;
+    }
+    Ok(backup)
 }
 
 fn write_json_to(file: File, value: &impl Serialize) -> Result<()> {
@@ -573,6 +732,35 @@ fn write_json_to(file: File, value: &impl Serialize) -> Result<()> {
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok(())
+}
+
+fn write_entry_atomic(root: &Path, path: &Path, data: &[u8], replace: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary_directory = root.join(CONTROL_DIR).join("tmp");
+    fs::create_dir_all(&temporary_directory)?;
+    let temporary = temporary_directory.join(Uuid::new_v4().to_string());
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        if replace {
+            fs::rename(&temporary, path)?;
+        } else {
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -598,17 +786,6 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result.with_context(|| format!("failed to persist {}", path.display()))
-}
-
-fn ensure_version(version: u32, path: &Path) -> Result<()> {
-    if version == CONTAINER_FORMAT_VERSION {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "unsupported format version {version} in {}",
-            path.display()
-        ))
-    }
 }
 
 fn list_entries(root: &Path, directory: &Path, entries: &mut Vec<EntryKey>) -> Result<()> {
