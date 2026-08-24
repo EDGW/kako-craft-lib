@@ -12,9 +12,9 @@ use uuid::Uuid;
 use crate::logging::ContainerLogger;
 
 use super::{
-    Buffer, CONTAINER_FORMAT_VERSION, Container, ContainerMetadata, ContainerWriteGuard,
-    CONTROL_DIR, EntryKey, LinkFromError, LinkInfo, UnlinkError, WriteError, WriterError,
-    metadata_path,
+    AddError, Buffer, CONTAINER_FORMAT_VERSION, CONTROL_DIR, Container, ContainerMetadata,
+    ContainerWriteGuard, CopyError, EntryKey, LinkFromError, LinkInfo, RemoveError, RenameError,
+    UnlinkError, WriteError, WriterError, metadata_path,
 };
 
 const LINKS_FILE: &str = "links.json";
@@ -73,11 +73,7 @@ impl LocalContainer {
         &self.path
     }
 
-    pub(crate) fn open_as(
-        path: PathBuf,
-        logical_name: String,
-        kind: &'static str,
-    ) -> Result<Self> {
+    pub(crate) fn open_as(path: PathBuf, logical_name: String, kind: &'static str) -> Result<Self> {
         Self::open(path, logical_name, kind)
     }
 
@@ -122,6 +118,7 @@ impl LocalContainer {
         metadata: ContainerMetadata,
         expected_kind: &'static str,
     ) -> Result<Self> {
+        metadata.validate(&metadata_path(&path))?;
         if metadata.kind != expected_kind {
             return Err(anyhow!(
                 "{} describes a '{}' container, not a '{}' container",
@@ -131,7 +128,10 @@ impl LocalContainer {
             ));
         }
         if !path.is_dir() {
-            return Err(anyhow!("container directory does not exist: {}", path.display()));
+            return Err(anyhow!(
+                "container directory does not exist: {}",
+                path.display()
+            ));
         }
 
         let logger = ContainerLogger::new(expected_kind, metadata.uid.clone());
@@ -166,6 +166,10 @@ impl LocalContainer {
 }
 
 impl Container for LocalContainer {
+    fn root_path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
     fn metadata(&self) -> ContainerMetadata {
         let span = container_operation_span!(self.logger, "metadata");
         let _entered = span.enter();
@@ -265,24 +269,59 @@ impl LocalContainerWriteGuard {
         }
         let links: IncomingLinksMetadata = read_json(&self.links_path)?;
         ensure_version(links.version, &self.links_path)?;
-        if links.count != links.links.len() as u64 {
+        let actual_count = links.links.values().map(Vec::len).sum::<usize>() as u64;
+        if links.count != actual_count {
             return Err(anyhow!(
                 "invalid link count in {}: recorded {}, actual {}",
                 self.links_path.display(),
                 links.count,
-                links.links.len()
+                actual_count
             ));
         }
         Ok(links)
     }
 
     fn save_links(&self, links: &mut IncomingLinksMetadata) -> Result<()> {
-        links.count = links.links.len() as u64;
+        links.count = links.links.values().map(Vec::len).sum::<usize>() as u64;
         write_json_atomic(&self.links_path, links)
+    }
+
+    fn is_linked_from(&self, key: &EntryKey) -> Result<bool> {
+        Ok(self.links()?.links.contains_key(key))
     }
 }
 
 impl ContainerWriteGuard for LocalContainerWriteGuard {
+    fn container_uid(&self) -> &str {
+        self.logger.uid()
+    }
+
+    fn add(&mut self, key: &EntryKey, data: Buffer) -> std::result::Result<(), AddError> {
+        let span = container_operation_span!(self.logger, "add");
+        let _entered = span.enter();
+        debug!(entry_key = %key, byte_count = data.len(), "adding container entry");
+        let path = self.entry_path(key).map_err(AddError::InvalidEntryKey)?;
+        if self.is_linked_from(key).map_err(AddError::Other)? {
+            return Err(AddError::EntryExists(key.clone()));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| AddError::Other(error.into()))?;
+        }
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(AddError::EntryExists(key.clone()));
+            }
+            Err(error) => return Err(AddError::Other(error.into())),
+        };
+        if let Err(error) = file.write_all(&data) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(AddError::Other(error.into()));
+        }
+        Ok(())
+    }
+
     fn write(&mut self, key: &EntryKey, data: Buffer) -> std::result::Result<(), WriteError> {
         let span = container_operation_span!(self.logger, "write");
         let _entered = span.enter();
@@ -294,9 +333,79 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         fs::write(&path, data).map_err(|error| WriteError::Other(error.into()))
     }
 
+    fn remove(&mut self, key: &EntryKey) -> std::result::Result<(), RemoveError> {
+        let span = container_operation_span!(self.logger, "remove");
+        let _entered = span.enter();
+        debug!(entry_key = %key, "removing container entry");
+        let path = self.entry_path(key).map_err(RemoveError::InvalidEntryKey)?;
+        if self.is_linked_from(key).map_err(RemoveError::Other)? {
+            return Err(RemoveError::EntryIsLinked(key.clone()));
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                remove_empty_parents(path.parent(), &self.root);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(RemoveError::EntryNotFound(key.clone()))
+            }
+            Err(error) => Err(RemoveError::Other(error.into())),
+        }
+    }
+
+    fn rename(&mut self, from: &EntryKey, to: &EntryKey) -> std::result::Result<(), RenameError> {
+        let span = container_operation_span!(self.logger, "rename");
+        let _entered = span.enter();
+        debug!(from = %from, to = %to, "renaming container entry");
+        let from_path = self
+            .entry_path(from)
+            .map_err(RenameError::InvalidEntryKey)?;
+        let to_path = self.entry_path(to).map_err(RenameError::InvalidEntryKey)?;
+        if self.is_linked_from(from).map_err(RenameError::Other)? {
+            return Err(RenameError::EntryIsLinked(from.clone()));
+        }
+        if self.is_linked_from(to).map_err(RenameError::Other)? {
+            return Err(RenameError::EntryIsLinked(to.clone()));
+        }
+        if !from_path.is_file() {
+            return Err(RenameError::EntryNotFound(from.clone()));
+        }
+        if fs::symlink_metadata(&to_path).is_ok() {
+            return Err(RenameError::EntryExists(to.clone()));
+        }
+        if let Some(parent) = to_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| RenameError::Other(error.into()))?;
+        }
+        fs::rename(&from_path, &to_path).map_err(|error| RenameError::Other(error.into()))?;
+        remove_empty_parents(from_path.parent(), &self.root);
+        Ok(())
+    }
+
+    fn copy(&mut self, from: &EntryKey, to: &EntryKey) -> std::result::Result<(), CopyError> {
+        let span = container_operation_span!(self.logger, "copy");
+        let _entered = span.enter();
+        debug!(from = %from, to = %to, "copying container entry");
+        let from_path = self.entry_path(from).map_err(CopyError::InvalidEntryKey)?;
+        let to_path = self.entry_path(to).map_err(CopyError::InvalidEntryKey)?;
+        if !from_path.is_file() {
+            return Err(CopyError::EntryNotFound(from.clone()));
+        }
+        if self.is_linked_from(to).map_err(CopyError::Other)?
+            || fs::symlink_metadata(&to_path).is_ok()
+        {
+            return Err(CopyError::EntryExists(to.clone()));
+        }
+        if let Some(parent) = to_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| CopyError::Other(error.into()))?;
+        }
+        fs::copy(&from_path, &to_path)
+            .map(|_| ())
+            .map_err(|error| CopyError::Other(error.into()))
+    }
+
     fn link_from(
         &mut self,
-        linker: &mut dyn Container,
+        linker_uid: &str,
         target_key: &EntryKey,
         linker_key: &EntryKey,
     ) -> std::result::Result<(), LinkFromError> {
@@ -311,29 +420,24 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
             return Err(LinkFromError::TargetNotFound(target_key.clone()));
         }
 
-        let linker_uid = linker.uid().map_err(LinkFromError::Other)?;
         let mut links = self.links().map_err(LinkFromError::Other)?;
-        if let Some(existing) = links.links.get(target_key) {
-            return if existing.linker_uid == linker_uid && existing.linker_key == *linker_key {
-                Err(LinkFromError::AlreadyLinked)
-            } else {
-                Err(LinkFromError::LinkConflict)
-            };
+        let incoming = links.links.entry(target_key.clone()).or_default();
+        if incoming
+            .iter()
+            .any(|link| link.linker_uid == linker_uid && link.linker_key == *linker_key)
+        {
+            return Err(LinkFromError::AlreadyLinked);
         }
-
-        links.links.insert(
-            target_key.clone(),
-            IncomingLink {
-                linker_key: linker_key.clone(),
-                linker_uid,
-            },
-        );
+        incoming.push(IncomingLink {
+            linker_key: linker_key.clone(),
+            linker_uid: linker_uid.to_owned(),
+        });
         self.save_links(&mut links).map_err(LinkFromError::Other)
     }
 
     fn unlink(
         &mut self,
-        linker: &mut dyn Container,
+        linker_uid: &str,
         target_key: &EntryKey,
         linker_key: &EntryKey,
     ) -> std::result::Result<(), UnlinkError> {
@@ -342,16 +446,19 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         debug!(target_key = %target_key, linker_key = %linker_key, "removing incoming link");
         validate_key(target_key).map_err(UnlinkError::InvalidEntryKey)?;
         validate_key(linker_key).map_err(UnlinkError::InvalidEntryKey)?;
-        let linker_uid = linker.uid().map_err(UnlinkError::Other)?;
         let mut links = self.links().map_err(UnlinkError::Other)?;
-        let Some(existing) = links.links.get(target_key) else {
+        let Some(incoming) = links.links.get_mut(target_key) else {
             return Err(UnlinkError::LinkNotFound);
         };
-        if existing.linker_uid != linker_uid || existing.linker_key != *linker_key {
+        let Some(position) = incoming.iter().position(|existing| {
+            existing.linker_uid == linker_uid && existing.linker_key == *linker_key
+        }) else {
             return Err(UnlinkError::LinkMismatch);
+        };
+        incoming.remove(position);
+        if incoming.is_empty() {
+            links.links.remove(target_key);
         }
-
-        links.links.remove(target_key);
         self.save_links(&mut links).map_err(UnlinkError::Other)
     }
 
@@ -362,12 +469,31 @@ impl ContainerWriteGuard for LocalContainerWriteGuard {
         validate_key(key).map_err(|key| anyhow!("invalid entry key: {key}"))?;
         let links = self.links()?;
         Ok(match links.links.get(key) {
-            Some(link) => LinkInfo::LinkFrom {
-                linker_key: link.linker_key.clone(),
-                linker_uid: link.linker_uid.clone(),
+            Some(links) => LinkInfo::LinkFrom {
+                linkers: links
+                    .iter()
+                    .map(|link| super::LinkSource {
+                        linker_key: link.linker_key.clone(),
+                        linker_uid: link.linker_uid.clone(),
+                    })
+                    .collect(),
             },
             None => LinkInfo::None,
         })
+    }
+
+    fn has_link_from(
+        &self,
+        target_key: &EntryKey,
+        linker_uid: &str,
+        linker_key: &EntryKey,
+    ) -> Result<bool> {
+        validate_key(target_key).map_err(|key| anyhow!("invalid entry key: {key}"))?;
+        Ok(self.links()?.links.get(target_key).is_some_and(|links| {
+            links
+                .iter()
+                .any(|link| link.linker_uid == linker_uid && link.linker_key == *linker_key)
+        }))
     }
 }
 
@@ -388,7 +514,7 @@ impl Drop for LocalContainerWriteGuard {
 struct IncomingLinksMetadata {
     version: u32,
     count: u64,
-    links: BTreeMap<EntryKey, IncomingLink>,
+    links: BTreeMap<EntryKey, Vec<IncomingLink>>,
 }
 
 impl Default for IncomingLinksMetadata {
@@ -407,7 +533,7 @@ struct IncomingLink {
     linker_uid: String,
 }
 
-fn validate_key(key: &EntryKey) -> std::result::Result<(), EntryKey> {
+pub(crate) fn validate_key(key: &EntryKey) -> std::result::Result<(), EntryKey> {
     let path = Path::new(key);
     if key.is_empty()
         || path.is_absolute()
@@ -429,6 +555,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))
 }
@@ -507,4 +634,16 @@ fn list_entries(root: &Path, directory: &Path, entries: &mut Vec<EntryKey>) -> R
         }
     }
     Ok(())
+}
+
+fn remove_empty_parents(mut directory: Option<&Path>, root: &Path) {
+    while let Some(path) = directory {
+        if path == root || !path.starts_with(root) {
+            break;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => directory = path.parent(),
+            Err(_) => break,
+        }
+    }
 }
