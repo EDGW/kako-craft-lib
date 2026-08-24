@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::{
-    AddError, BrokenLinkError, CONTAINER_METADATA_FILE, CONTROL_DIR, CheckRepairAction, Container,
-    ContainerMetadata, ContainerWriteGuard, CopyError, EntryKey, INCOMING_LINKS_FORMAT_VERSION,
-    LinkCheckKind, LinkContainer, LinkFromError, LinkInfo, LinkMetadataMigrationError, LinkToError,
-    LinkUnavailableError, LinkValidationIssueKind, LinkValidationRunError, LocalContainer,
-    OUTGOING_LINKS_FORMAT_VERSION, RemoveError, RenameError, UnlinkToError, WriteError,
-    WriterError, open_container, open_container_from_json,
+    AddError, BrokenLinkError, CONTAINER_METADATA_FILE, CONTROL_DIR, CheckActionError,
+    CheckRepairAction, Container, ContainerMetadata, ContainerWriteGuard, CopyError, EntryKey,
+    INCOMING_LINKS_FORMAT_VERSION, LinkCheckKind, LinkContainer, LinkFromError, LinkInfo,
+    LinkMetadataMigrationError, LinkToError, LinkUnavailableError, LinkValidationIssueKind,
+    LinkValidationRunError, LocalContainer, OUTGOING_LINKS_FORMAT_VERSION, RemoveError,
+    RenameError, UnlinkToError, WriteError, WriterError, open_container, open_container_from_json,
 };
 
 struct TestDirectory {
@@ -393,6 +393,8 @@ fn outgoing_link_validation_returns_broken_and_check_reports_it() {
     fs::remove_file(target_path.join(&target_key)).unwrap();
     let error = linker.read(&linker_key).unwrap_err();
     assert!(error.downcast_ref::<BrokenLinkError>().is_some());
+    let error = linker.filepath(&linker_key).unwrap_err();
+    assert!(error.downcast_ref::<BrokenLinkError>().is_some());
     fs::remove_file(linker_path.join(&linker_key)).unwrap();
     let issues = linker.writer().unwrap().check(&[]).unwrap();
     assert!(issues.iter().any(|issue| {
@@ -494,6 +496,111 @@ fn outgoing_link_rename_updates_both_sides_without_losing_the_target() {
             .writer()
             .unwrap()
             .validate_links(&new_key, &[&target])
+            .unwrap()
+            .is_valid()
+    );
+}
+
+#[test]
+fn outgoing_link_rename_rolls_back_an_atomic_incoming_rename_on_install_failure() {
+    crate::tests::init_tracing();
+    let directory = TestDirectory::new();
+    let mut target = LocalContainer::new(directory.join("target")).unwrap();
+    let linker = LinkContainer::new(directory.join("linker")).unwrap();
+    let target_key: EntryKey = "target".into();
+    let old_key: EntryKey = "old".into();
+    let new_key: EntryKey = "new".into();
+    target
+        .writer()
+        .unwrap()
+        .write(&target_key, b"data".to_vec())
+        .unwrap();
+    linker
+        .writer()
+        .unwrap()
+        .link_to(&old_key, &mut target, &target_key, None)
+        .unwrap();
+
+    super::link::fail_outgoing_metadata_write_after(0);
+    assert!(
+        linker
+            .writer()
+            .unwrap()
+            .link_rename(&old_key, &new_key)
+            .is_err()
+    );
+
+    assert_eq!(linker.read(&old_key).unwrap(), b"data");
+    assert!(fs::symlink_metadata(linker.path().join(&new_key)).is_err());
+    let LinkInfo::LinkFrom { linkers } = target.writer().unwrap().link_info(&target_key).unwrap()
+    else {
+        panic!("rolled-back reciprocal incoming record is missing");
+    };
+    assert_eq!(linkers.len(), 1);
+    assert_eq!(linkers[0].linker_key, old_key);
+    assert!(
+        linker
+            .writer()
+            .unwrap()
+            .validate_links(&old_key, &[&target])
+            .unwrap()
+            .is_valid()
+    );
+}
+
+#[test]
+fn partial_link_commit_is_typed_detectable_and_repairable() {
+    crate::tests::init_tracing();
+    let directory = TestDirectory::new();
+    let target_path = directory.join("target");
+    let mut target = LocalContainer::new(&target_path).unwrap();
+    let linker = LinkContainer::new(directory.join("linker")).unwrap();
+    let target_key: EntryKey = "target".into();
+    let linker_key: EntryKey = "link".into();
+    target
+        .writer()
+        .unwrap()
+        .write(&target_key, b"data".to_vec())
+        .unwrap();
+
+    super::link::fail_outgoing_metadata_write_after(0);
+    super::local::fail_incoming_metadata_write_after(1);
+    let error = linker
+        .writer()
+        .unwrap()
+        .link_to(&linker_key, &mut target, &target_key, None)
+        .unwrap_err();
+    assert!(matches!(error, LinkToError::PartialCommit(_)));
+    assert!(!linker.path().join(&linker_key).exists());
+
+    let mut target_writer = target.writer().unwrap();
+    let issues = target_writer.check(&[&linker]).unwrap();
+    let issue = issues
+        .iter()
+        .find(|issue| {
+            issue.kind == LinkCheckKind::Validation(LinkValidationIssueKind::MissingOutgoingRecord)
+        })
+        .expect("partial commit should be reported as a missing outgoing record");
+    assert!(
+        issue
+            .actions
+            .contains(&CheckRepairAction::AddMissingOutgoingRecord)
+    );
+    target_writer
+        .apply_check_action(
+            issue,
+            CheckRepairAction::AddMissingOutgoingRecord,
+            &[&linker],
+        )
+        .unwrap();
+    drop(target_writer);
+
+    assert_eq!(linker.read(&linker_key).unwrap(), b"data");
+    assert!(
+        target
+            .writer()
+            .unwrap()
+            .validate_links(&target_key, &[&linker])
             .unwrap()
             .is_valid()
     );
@@ -1158,6 +1265,51 @@ fn validation_can_report_valid_broken_ignored_and_unavailable_together() {
 }
 
 #[test]
+fn one_corresponding_container_reports_all_valid_and_broken_sources() {
+    crate::tests::init_tracing();
+    let directory = TestDirectory::new();
+    let target_path = directory.join("target");
+    let linker_path = directory.join("linker");
+    let mut target = LocalContainer::new(&target_path).unwrap();
+    let linker = LinkContainer::new(&linker_path).unwrap();
+    let target_key: EntryKey = "target".into();
+    let valid_key: EntryKey = "valid".into();
+    let broken_key: EntryKey = "broken".into();
+    target
+        .writer()
+        .unwrap()
+        .write(&target_key, b"data".to_vec())
+        .unwrap();
+    for linker_key in [&valid_key, &broken_key] {
+        linker
+            .writer()
+            .unwrap()
+            .link_to(linker_key, &mut target, &target_key, None)
+            .unwrap();
+    }
+    let outgoing = outgoing_path(&linker_path);
+    let mut metadata = metadata_json(&outgoing);
+    metadata["links"][&broken_key]["target_key"] = serde_json::json!("wrong-target");
+    write_metadata_json(&outgoing, &metadata);
+
+    let report = target
+        .writer()
+        .unwrap()
+        .validate_links(&target_key, &[&linker])
+        .unwrap();
+    assert!(
+        report
+            .valid
+            .iter()
+            .any(|link_match| link_match.linker_key == valid_key)
+    );
+    assert!(report.broken.iter().any(|issue| {
+        issue.kind == LinkValidationIssueKind::TargetKeyMismatch
+            && issue.linker_key.as_ref() == Some(&broken_key)
+    }));
+}
+
+#[test]
 fn check_offers_and_applies_specific_symlink_action() {
     crate::tests::init_tracing();
     let directory = TestDirectory::new();
@@ -1192,6 +1344,10 @@ fn check_offers_and_applies_specific_symlink_action() {
             CheckRepairAction::Skip
         ]
     );
+    let invalid = writer
+        .apply_check_action(issue, CheckRepairAction::DeleteUnrecordedSymlink, &[])
+        .unwrap_err();
+    assert!(invalid.downcast_ref::<CheckActionError>().is_some());
     writer
         .apply_check_action(issue, CheckRepairAction::CreateMissingSymlink, &[])
         .unwrap();
@@ -1582,6 +1738,38 @@ fn outgoing_migration_backup_failure_preserves_original_metadata() {
     fs::create_dir(file.with_file_name("outgoing-links.json.v1.backup")).unwrap();
 
     let error = linker.prefer_relative().unwrap_err();
+    assert!(error.downcast_ref::<LinkMetadataMigrationError>().is_some());
+    assert_eq!(fs::read(&file).unwrap(), original);
+}
+
+#[test]
+fn incoming_migration_backup_failure_preserves_original_metadata() {
+    crate::tests::init_tracing();
+    let directory = TestDirectory::new();
+    let target_path = directory.join("target");
+    let target = LocalContainer::new(&target_path).unwrap();
+    let target_key: EntryKey = "target".into();
+    target
+        .writer()
+        .unwrap()
+        .write(&target_key, b"data".to_vec())
+        .unwrap();
+    let file = incoming_path(&target_path);
+    let old = serde_json::json!({
+        "version": 1,
+        "count": 1,
+        "links": {
+            "target": {
+                "linker_uid": "linker-uid",
+                "linker_key": "linker-key"
+            }
+        }
+    });
+    write_metadata_json(&file, &old);
+    let original = fs::read(&file).unwrap();
+    fs::create_dir(file.with_file_name("links.json.v1.backup")).unwrap();
+
+    let error = target.writer().unwrap().link_info(&target_key).unwrap_err();
     assert!(error.downcast_ref::<LinkMetadataMigrationError>().is_some());
     assert_eq!(fs::read(&file).unwrap(), original);
 }
