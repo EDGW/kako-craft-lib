@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), deny(clippy::missing_docs_in_private_items))]
 
 pub mod container;
+pub mod destination;
 
 mod logging;
 
