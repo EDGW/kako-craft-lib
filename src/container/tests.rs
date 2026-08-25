@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
+use super::testing::{BrokenFixtureErrorKind, create_broken_containers};
 use super::{
     AddError, BrokenLinkError, CONTAINER_METADATA_FILE, CONTROL_DIR, CheckActionError,
     CheckRepairAction, Container, ContainerMetadata, ContainerWriteGuard, CopyError, EntryKey,
@@ -1774,4 +1775,34 @@ fn incoming_migration_backup_failure_preserves_original_metadata() {
     let error = target.writer().unwrap().link_info(&target_key).unwrap_err();
     assert!(error.downcast_ref::<LinkMetadataMigrationError>().is_some());
     assert_eq!(fs::read(&file).unwrap(), original);
+}
+
+#[test]
+fn broken_fixture_generator_reports_actual_supported_error_kinds() {
+    crate::tests::init_tracing();
+    let directory = TestDirectory::new();
+    let root = directory.join("broken-fixtures");
+    let fixture = create_broken_containers(&root).unwrap();
+
+    assert_eq!(fixture.root, root);
+    assert!(!fixture.containers.is_empty());
+    assert!(fixture.cases.len() >= 16);
+    assert_eq!(
+        fixture.uncovered_validation_kinds,
+        [LinkValidationIssueKind::DuplicateOutgoingRecord]
+    );
+    assert!(fixture.cases.iter().all(|case| !case.errors.is_empty()));
+    for expected in [
+        BrokenFixtureErrorKind::MissingSymlink,
+        BrokenFixtureErrorKind::IncorrectSymlink,
+        BrokenFixtureErrorKind::UnrecordedSymlink,
+    ] {
+        assert!(
+            fixture
+                .cases
+                .iter()
+                .any(|case| case.errors.contains(&expected))
+        );
+    }
+    assert!(create_broken_containers(&root).is_err());
 }

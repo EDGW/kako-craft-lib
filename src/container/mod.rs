@@ -22,6 +22,7 @@ pub mod link;
 pub mod local;
 mod model;
 mod open;
+pub mod testing;
 mod traits;
 mod validation;
 
