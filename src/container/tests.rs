@@ -1,3 +1,5 @@
+//! End-to-end container storage, linking, validation, migration, and repair tests.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

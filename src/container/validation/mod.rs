@@ -1,3 +1,5 @@
+//! Bidirectional link-validation orchestration.
+
 mod compare;
 mod path;
 pub(crate) mod report;
@@ -11,6 +13,22 @@ use super::{
     LinkValidationRunError, LinkValidationUnavailable, open_container,
 };
 
+/// Opens the target containers recorded by one outgoing key and validates reciprocal state.
+///
+/// # Arguments
+///
+/// * `current` - Complete snapshot of the container owning the outgoing records.
+/// * `key` - Linker entry key whose recorded target containers should be opened and compared.
+///
+/// # Returns
+///
+/// A report containing exact matches, broken recorded paths or identities, and temporarily
+/// unavailable targets. A key without outgoing records returns an empty report.
+///
+/// # Errors
+///
+/// Returns [`LinkValidationRunError`] when a readable target fails an unclassified operation or the
+/// delegated multi-container comparison rejects its inputs.
 pub(crate) fn validate_recorded_link_snapshots(
     current: &ContainerLinkSnapshot,
     key: &EntryKey,

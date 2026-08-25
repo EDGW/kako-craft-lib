@@ -1,3 +1,5 @@
+//! Locked outgoing-link access validation.
+
 use std::path::{Path, PathBuf};
 
 use super::super::{
@@ -7,6 +9,26 @@ use super::super::{
 use super::filesystem::{resolved_container_path, verify_materialized_symlink};
 use super::metadata::OutgoingLink;
 
+/// Validates an outgoing record and acquires its target container writer.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning the outgoing record.
+/// * `key` - Linker entry key used in diagnostics and reciprocal-record lookup.
+/// * `linker_uid` - Persistent UID of the owning link container.
+/// * `link_path` - Materialized symlink path for `key`.
+/// * `link` - Outgoing metadata record identifying the target container and entry.
+///
+/// # Returns
+///
+/// A write guard for the verified target container together with its resolved target-entry path.
+/// The target guard remains locked for the caller's subsequent read or write.
+///
+/// # Errors
+///
+/// Returns [`LinkAccessError::Broken`] when the target path, UID, key, reciprocal record, or symlink
+/// is inconsistent, and [`LinkAccessError::Unavailable`] when the verified target writer cannot be
+/// acquired.
 pub(super) fn validate_outgoing_link_locked(
     root: &Path,
     key: &EntryKey,

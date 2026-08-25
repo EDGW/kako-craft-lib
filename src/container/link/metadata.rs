@@ -1,3 +1,5 @@
+//! Outgoing-link metadata schema, loading, and version-one migration.
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -13,10 +15,14 @@ use super::super::{
 use super::filesystem::{absolute_path, recorded_container_path, write_json_atomic};
 
 #[derive(Debug, Serialize, Deserialize)]
+/// Versioned metadata owned by a link container for all outgoing relationships.
 pub(super) struct OutgoingLinksMetadata {
+    /// On-disk schema version used to select parsing or migration behavior.
     pub(super) version: u32,
     #[serde(default = "default_prefer_relative")]
+    /// Container-wide default controlling relative recorded paths and symbolic-link targets.
     pub(super) prefer_relative: bool,
+    /// Outgoing records indexed by the linker entry key materialized in this container.
     pub(super) links: BTreeMap<EntryKey, OutgoingLink>,
 }
 
@@ -31,16 +37,39 @@ impl Default for OutgoingLinksMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted identity and location of one outgoing link target.
 pub(super) struct OutgoingLink {
+    /// Entry key in the target container.
     pub(super) target_key: EntryKey,
+    /// Persistent UID expected from the target container at access time.
     pub(super) container_uid: String,
+    /// Target container path, absolute or relative to the owning link-container root.
     pub(super) container_path: PathBuf,
 }
 
+/// Supplies the relative-path preference when older JSON omits the field.
+///
+/// # Returns
+///
+/// `true`, preserving the default of preferring relative paths.
 fn default_prefer_relative() -> bool {
     true
 }
 
+/// Loads current outgoing metadata or safely migrates version-one metadata.
+///
+/// # Arguments
+///
+/// * `path` - Full path to the owning link container's `outgoing-links.json` file.
+///
+/// # Returns
+///
+/// Parsed current metadata, or empty default metadata when the file does not exist.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed, its version is absent or unsupported,
+/// or a required version-one migration cannot be verified, backed up, or persisted.
 pub(super) fn read_metadata(path: &Path) -> Result<OutgoingLinksMetadata> {
     if !path.exists() {
         return Ok(OutgoingLinksMetadata::default());
@@ -66,6 +95,22 @@ pub(super) fn read_metadata(path: &Path) -> Result<OutgoingLinksMetadata> {
     }
 }
 
+/// Converts parsed version-one outgoing JSON to the current container-path schema.
+///
+/// # Arguments
+///
+/// * `path` - Existing version-one metadata-file path, also used to derive its container root.
+/// * `value` - Parsed version-one JSON object to validate and convert.
+///
+/// # Returns
+///
+/// Current metadata after its target UIDs are verified, the source is backed up, and the migrated
+/// document is atomically persisted.
+///
+/// # Errors
+///
+/// Returns a typed migration error for malformed records, unverifiable target paths or UIDs,
+/// unsafe backup state, or failure to persist the migrated document.
 fn migrate_outgoing_v1(path: &Path, value: serde_json::Value) -> Result<OutgoingLinksMetadata> {
     let root = path
         .parent()
@@ -192,6 +237,16 @@ fn migrate_outgoing_v1(path: &Path, value: serde_json::Value) -> Result<Outgoing
     Ok(metadata)
 }
 
+/// Constructs a typed outgoing-metadata migration failure.
+///
+/// # Arguments
+///
+/// * `path` - Metadata-file path whose migration failed.
+/// * `reason` - Specific validation, backup, or persistence failure.
+///
+/// # Returns
+///
+/// An erased [`LinkMetadataMigrationError::Failed`] retaining `path` and `reason`.
 fn migration_failed(path: &Path, reason: impl Into<String>) -> anyhow::Error {
     LinkMetadataMigrationError::Failed {
         path: path.to_owned(),
@@ -200,6 +255,20 @@ fn migration_failed(path: &Path, reason: impl Into<String>) -> anyhow::Error {
     .into()
 }
 
+/// Creates and synchronizes the stable `.v1.backup` sibling before migration.
+///
+/// # Arguments
+///
+/// * `path` - Existing version-one outgoing metadata file to copy.
+///
+/// # Returns
+///
+/// The backup path, reusing an existing regular-file backup without overwriting it.
+///
+/// # Errors
+///
+/// Returns a typed migration error if the filename is unavailable, an existing backup is not a
+/// regular file, or copying, opening, or synchronizing the backup fails.
 fn backup_v1(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()

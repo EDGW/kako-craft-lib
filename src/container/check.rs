@@ -1,3 +1,5 @@
+//! Link-consistency issue construction and explicitly selected repair actions.
+
 use std::collections::BTreeSet;
 
 use anyhow::Result;
@@ -7,6 +9,20 @@ use super::{
     LinkCheckIssue, LinkCheckKind, LinkValidationIssueKind, open_container,
 };
 
+/// Converts validation reports for all locally recorded keys into actionable check issues.
+///
+/// # Arguments
+///
+/// * `guard` - Write guard for the current container; it remains held while snapshots are read.
+/// * `corresponding` - Candidate peer containers against which reciprocal records are validated.
+///
+/// # Returns
+///
+/// A stable, sorted, deduplicated list of validation and availability issues with allowed repairs.
+///
+/// # Errors
+///
+/// Returns an error if current metadata cannot be snapshotted or any key cannot be validated.
 pub(crate) fn validation_check_issues<G: ContainerWriteGuard + ?Sized>(
     guard: &G,
     corresponding: &[&dyn Container],
@@ -131,6 +147,24 @@ pub(crate) fn validation_check_issues<G: ContainerWriteGuard + ?Sized>(
     Ok(issues)
 }
 
+/// Applies one user-selected repair action while the current write guard stays held.
+///
+/// # Arguments
+///
+/// * `guard` - Mutable write guard for the container being checked.
+/// * `issue` - Previously reported issue that supplies relationship identity and repair context.
+/// * `action` - One of the repair choices offered in `issue.actions`.
+/// * `corresponding` - Candidate peer containers used to acquire the reciprocal writer by UID.
+///
+/// # Returns
+///
+/// A concrete human-readable description of the mutation, retry request, or skipped issue.
+///
+/// # Errors
+///
+/// Returns an error when required issue context is absent, `action` is invalid for `issue`, a
+/// corresponding UID is ambiguous or mismatched, a peer cannot be opened or locked, or the
+/// selected metadata mutation fails.
 pub(crate) fn apply_validation_check_action<G: ContainerWriteGuard + ?Sized>(
     guard: &mut G,
     issue: &LinkCheckIssue,
@@ -295,6 +329,20 @@ pub(crate) fn apply_validation_check_action<G: ContainerWriteGuard + ?Sized>(
     }
 }
 
+/// Finds exactly one supplied corresponding container by persistent UID.
+///
+/// # Arguments
+///
+/// * `corresponding` - Candidate containers to inspect without taking ownership.
+/// * `uid` - Persistent UID required by the check issue.
+///
+/// # Returns
+///
+/// `Some(container)` for one match or `None` when no supplied container has `uid`.
+///
+/// # Errors
+///
+/// Returns an error if a candidate UID cannot be read or more than one candidate has `uid`.
 fn corresponding_by_uid<'a>(
     corresponding: &'a [&dyn Container],
     uid: &str,
@@ -311,6 +359,21 @@ fn corresponding_by_uid<'a>(
     Ok(matched)
 }
 
+/// Acquires the peer write guard required to repair an issue.
+///
+/// # Arguments
+///
+/// * `issue` - Check issue containing the expected peer UID and, when needed, its recorded path.
+/// * `corresponding` - Already opened candidate peers preferred over reopening the recorded path.
+///
+/// # Returns
+///
+/// A write guard for the uniquely identified corresponding container.
+///
+/// # Errors
+///
+/// Returns an error when context is missing, supplied UIDs are ambiguous, the recorded path cannot
+/// be opened, the opened UID differs from the recorded UID, or the peer writer cannot be acquired.
 fn issue_corresponding_writer(
     issue: &LinkCheckIssue,
     corresponding: &[&dyn Container],

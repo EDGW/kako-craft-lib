@@ -1,3 +1,5 @@
+//! Atomic metadata persistence and symbolic-link filesystem helpers.
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -10,6 +12,21 @@ use uuid::Uuid;
 use super::super::{CONTROL_DIR, EntryKey};
 use super::metadata::OutgoingLink;
 
+/// Serializes JSON to a temporary sibling and atomically replaces a metadata file.
+///
+/// # Arguments
+///
+/// * `path` - Final metadata-file path to replace.
+/// * `value` - Serializable metadata value written as pretty JSON with a trailing newline.
+///
+/// # Returns
+///
+/// `Ok(())` after the temporary file is flushed, synchronized, and renamed to `path`.
+///
+/// # Errors
+///
+/// Returns an error if `path` has no parent or directory creation, serialization, synchronization,
+/// or replacement fails. A created temporary file is removed on failure when possible.
 pub(super) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path
         .parent()
@@ -39,6 +56,19 @@ pub(super) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(
     result.with_context(|| format!("failed to persist {}", path.display()))
 }
 
+/// Converts a possibly relative path to an absolute path without canonicalizing it.
+///
+/// # Arguments
+///
+/// * `path` - Path to preserve when absolute or resolve against the process working directory.
+///
+/// # Returns
+///
+/// The original absolute path or the current working directory joined with a relative path.
+///
+/// # Errors
+///
+/// Returns an error only when the current working directory is required but cannot be read.
 pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_owned())
@@ -47,6 +77,18 @@ pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Selects the path representation persisted for a target container.
+///
+/// # Arguments
+///
+/// * `root` - Linking container root used as the base for relative-path calculation.
+/// * `target_root` - Target container root to record.
+/// * `prefer_relative` - When `true`, use a computable path relative to `root`; when `false`, retain
+///   `target_root` exactly.
+///
+/// # Returns
+///
+/// A relative target-container path when requested and representable, otherwise `target_root`.
 pub(super) fn recorded_container_path(
     root: &Path,
     target_root: &Path,
@@ -58,6 +100,17 @@ pub(super) fn recorded_container_path(
     target_root.to_owned()
 }
 
+/// Resolves an outgoing record's stored container path from its owner root.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning `link`.
+/// * `link` - Outgoing record whose target-container path may be relative or absolute.
+///
+/// # Returns
+///
+/// The absolute-form candidate target root: an absolute record unchanged or a relative record
+/// joined below `root`.
 pub(super) fn resolved_container_path(root: &Path, link: &OutgoingLink) -> PathBuf {
     if link.container_path.is_absolute() {
         link.container_path.clone()
@@ -66,10 +119,33 @@ pub(super) fn resolved_container_path(root: &Path, link: &OutgoingLink) -> PathB
     }
 }
 
+/// Resolves the target entry filename described by an outgoing record.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning `link`.
+/// * `link` - Outgoing record containing the target container path and target entry key.
+///
+/// # Returns
+///
+/// The resolved target-container root joined with the target entry key.
 pub(super) fn target_filename(root: &Path, link: &OutgoingLink) -> PathBuf {
     resolved_container_path(root, link).join(&link.target_key)
 }
 
+/// Chooses the filesystem target text stored in a materialized symbolic link.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning the outgoing record.
+/// * `link_path` - Filesystem location at which the symbolic link is materialized.
+/// * `link` - Outgoing metadata record identifying the target entry.
+/// * `prefer_relative` - When `true`, make the symlink target relative to `link_path`'s parent when
+///   possible; when `false`, use the resolved target filename directly.
+///
+/// # Returns
+///
+/// The relative or direct path text that should be passed to the platform symlink API.
 pub(super) fn symlink_target(
     root: &Path,
     link_path: &Path,
@@ -86,6 +162,23 @@ pub(super) fn symlink_target(
     target_filename
 }
 
+/// Creates the symbolic link represented by an outgoing metadata record.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning the record.
+/// * `link_path` - Destination path for the new symbolic link.
+/// * `link` - Outgoing record identifying the target container and entry.
+/// * `prefer_relative` - Controls whether the symlink target should be relative when possible.
+///
+/// # Returns
+///
+/// `Ok(())` after parent directories exist and the platform symlink is created.
+///
+/// # Errors
+///
+/// Returns an error if `link_path` has no parent, directories cannot be created, or the symbolic
+/// link cannot be created (including when a filesystem entry already occupies `link_path`).
 pub(super) fn materialize_symlink(
     root: &Path,
     link_path: &Path,
@@ -106,6 +199,24 @@ pub(super) fn materialize_symlink(
     })
 }
 
+/// Verifies that a materialized symbolic link exactly matches its outgoing record.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link container owning the record.
+/// * `link_path` - Expected symbolic-link filesystem path.
+/// * `link` - Outgoing record used to derive the expected target.
+/// * `prefer_relative` - Relative-target policy used when the link was materialized.
+///
+/// # Returns
+///
+/// `Ok(())` only when `link_path` is readable as a symlink and its stored target equals the expected
+/// path byte-for-byte.
+///
+/// # Errors
+///
+/// Returns an error when the symlink is missing or unreadable, is not a symlink, or points to a
+/// different target.
 pub(super) fn verify_materialized_symlink(
     root: &Path,
     link_path: &Path,
@@ -131,6 +242,21 @@ pub(super) fn verify_materialized_symlink(
     }
 }
 
+/// Recursively collects all symbolic links below a container root.
+///
+/// # Arguments
+///
+/// * `root` - Container root used to derive entry keys and exclude its top-level `.kcl` directory.
+/// * `directory` - Current directory to traverse; callers initially pass `root`.
+/// * `symlinks` - Output map populated with root-relative entry keys and stored symlink targets.
+///
+/// # Returns
+///
+/// `Ok(())` after every reachable subdirectory has been scanned.
+///
+/// # Errors
+///
+/// Returns an error when a directory entry, file type, or symlink target cannot be read.
 pub(super) fn collect_symlinks(
     root: &Path,
     directory: &Path,
@@ -160,11 +286,39 @@ pub(super) fn collect_symlinks(
 }
 
 #[cfg(unix)]
+/// Creates a file symbolic link using the Unix filesystem API.
+///
+/// # Arguments
+///
+/// * `target` - Path text stored as the symlink target; it need not exist yet.
+/// * `link` - Filesystem path at which to create the symlink.
+///
+/// # Returns
+///
+/// `Ok(())` after creation, or the operating-system I/O error from `symlink`.
+///
+/// # Errors
+///
+/// Returns the platform I/O error when the symlink cannot be created.
 pub(super) fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
 #[cfg(windows)]
+/// Creates a file symbolic link using the Windows filesystem API.
+///
+/// # Arguments
+///
+/// * `target` - Path text stored as the symlink target; it need not exist yet.
+/// * `link` - Filesystem path at which to create the symlink.
+///
+/// # Returns
+///
+/// `Ok(())` after creation, or the operating-system I/O error from `symlink_file`.
+///
+/// # Errors
+///
+/// Returns the platform I/O error when the symlink cannot be created.
 pub(super) fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }

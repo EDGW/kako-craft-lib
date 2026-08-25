@@ -1,16 +1,42 @@
+//! Link-container write guard and multi-container mutation transactions.
+
 use super::*;
 
 mod container;
 
+/// Exclusive write guard for one link container.
+///
+/// The guard owns the current container lock and is the only public surface
+/// for changing its local entries, outgoing metadata, or symbolic links.
 pub struct LinkContainerWriteGuard {
+    /// Root directory containing ordinary entries and materialized outgoing symlinks.
     pub(super) root: PathBuf,
+    /// Persistent UID of the locked link container.
     pub(super) uid: String,
+    /// Full path of the authoritative `.kcl/outgoing-links.json` document.
     pub(super) metadata_path: PathBuf,
+    /// Underlying local guard that owns the advisory lock and ordinary-entry operations.
     pub(super) local: Box<dyn ContainerWriteGuard>,
+    /// Stable link-container identity attached to guarded-operation tracing spans.
     pub(super) logger: ContainerLogger,
 }
 
 impl LinkContainerWriteGuard {
+    /// Sets the default path policy used by subsequent [`Self::link_to`] calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefer_relative` - `true` to record relative target-container paths
+    ///   whenever calculable; `false` to record absolute paths.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after the container-level preference is persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if changing the preference would reinterpret existing
+    /// outgoing links or metadata cannot be read or persisted.
     pub fn set_prefer_relative(&mut self, prefer_relative: bool) -> Result<()> {
         let mut metadata = self.outgoing_metadata()?;
         if !metadata.links.is_empty() && metadata.prefer_relative != prefer_relative {
@@ -21,16 +47,51 @@ impl LinkContainerWriteGuard {
         info!(prefer_relative, "updated link-container path preference");
         Ok(())
     }
+    /// Validates a key and resolves its path below the locked container root.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Root-relative ordinary or outgoing-link entry key.
+    ///
+    /// # Returns
+    ///
+    /// The container root joined with `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `key` is empty, absolute, escapes the root, or enters `.kcl`.
     fn entry_path(&self, key: &EntryKey) -> Result<PathBuf> {
         super::super::local::validate_key(key)
             .map_err(|key| anyhow!("invalid entry key: {key}"))?;
         Ok(self.root.join(key))
     }
 
+    /// Loads authoritative outgoing metadata for the locked container.
+    ///
+    /// # Returns
+    ///
+    /// Parsed current metadata, including any safely migrated version-one records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata cannot be read, parsed, validated, or migrated.
     pub(super) fn outgoing_metadata(&self) -> Result<OutgoingLinksMetadata> {
         read_metadata(&self.metadata_path)
     }
 
+    /// Atomically persists authoritative outgoing metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - Complete current-version document that will replace the existing file.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after synchronized JSON is installed at `metadata_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization or filesystem persistence fails.
     fn save_metadata(&self, metadata: &OutgoingLinksMetadata) -> Result<()> {
         #[cfg(test)]
         if should_fail_outgoing_metadata_write() {
@@ -39,6 +100,21 @@ impl LinkContainerWriteGuard {
         write_json_atomic(&self.metadata_path, metadata)
     }
 
+    /// Resolves an entry path after validating an outgoing relationship when present.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Ordinary or outgoing-link entry key to resolve.
+    ///
+    /// # Returns
+    ///
+    /// The materialized path below this container root. For an outgoing key, the target container
+    /// remains locked only during validation and is released before return.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid key, unreadable metadata, broken link state, or unavailable
+    /// target writer.
     fn filepath_verified(&self, key: &EntryKey) -> Result<PathBuf> {
         let link_path = self.entry_path(key)?;
         let metadata = self.outgoing_metadata()?;
@@ -50,6 +126,20 @@ impl LinkContainerWriteGuard {
         Ok(link_path)
     }
 
+    /// Resolves only an ordinary local entry path without following outgoing links.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Candidate ordinary entry key.
+    ///
+    /// # Returns
+    ///
+    /// The ordinary entry path supplied by the underlying local guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if outgoing metadata cannot be read, `key` is an outgoing link, or local
+    /// key validation fails.
     pub(super) fn local_filepath_verified(&self, key: &EntryKey) -> Result<PathBuf> {
         if self.outgoing_metadata()?.links.contains_key(key) {
             return Err(anyhow!("entry is an outgoing link: {key}"));
@@ -57,6 +147,20 @@ impl LinkContainerWriteGuard {
         self.local.filepath(key)
     }
 
+    /// Reads only ordinary local content without following outgoing links.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Candidate ordinary entry key.
+    ///
+    /// # Returns
+    ///
+    /// A newly allocated buffer containing the local entry bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if outgoing metadata cannot be read, `key` is an outgoing link, or the
+    /// ordinary entry cannot be validated or read.
     pub(super) fn local_read_verified(&self, key: &EntryKey) -> Result<Buffer> {
         if self.outgoing_metadata()?.links.contains_key(key) {
             return Err(anyhow!("entry is an outgoing link: {key}"));
@@ -64,6 +168,20 @@ impl LinkContainerWriteGuard {
         self.local.read(key)
     }
 
+    /// Reads an ordinary entry or a fully validated outgoing target.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Entry key to read from local storage or through an outgoing relationship.
+    ///
+    /// # Returns
+    ///
+    /// A newly allocated buffer containing the selected local or target entry bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable metadata or local data, invalid keys, broken relationship
+    /// identity or symlink state, target lock unavailability, or target read failure.
     fn read_verified(&self, key: &EntryKey) -> Result<Buffer> {
         let metadata = self.outgoing_metadata()?;
         let Some(link) = metadata.links.get(key) else {
@@ -78,6 +196,17 @@ impl LinkContainerWriteGuard {
         })
     }
 
+    /// Compares authoritative outgoing records with all materialized symlinks.
+    ///
+    /// # Returns
+    ///
+    /// Deterministic issues for missing, incorrect, and unrecorded symlinks, each with concrete
+    /// actions supported by [`Self::repair_link_issue`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata, directories, file types, or symbolic-link targets cannot be
+    /// read.
     fn check_links(&self) -> Result<Vec<LinkCheckIssue>> {
         debug!("checking outgoing metadata and materialized symlinks");
         let metadata = self.outgoing_metadata()?;
@@ -188,6 +317,21 @@ impl LinkContainerWriteGuard {
         Ok(issues)
     }
 
+    /// Applies one explicitly selected filesystem repair for a link check issue.
+    ///
+    /// # Arguments
+    ///
+    /// * `issue` - Previously reported missing, incorrect, or unrecorded symlink issue.
+    /// * `action` - Concrete action offered by the issue, including `Skip`.
+    ///
+    /// # Returns
+    ///
+    /// A human-readable description of the performed mutation or skipped issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action does not match the issue, metadata changed, a non-symlink
+    /// would be overwritten, or symbolic-link removal or creation fails.
     fn repair_link_issue(
         &self,
         issue: &LinkCheckIssue,
@@ -249,6 +393,28 @@ impl LinkContainerWriteGuard {
 
     /// Links `linker_key` in this container to `target_key` in `target`.
     /// The linker write lock remains held throughout the operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - New outgoing key to occupy in the locked link
+    ///   container.
+    /// * `target` - Target container whose writer will be acquired
+    ///   non-blockingly and whose reciprocal incoming record will be updated.
+    /// * `target_key` - Existing ordinary entry key in `target`.
+    /// * `prefer_relative` - Per-link path-policy override: `Some(true)`
+    ///   prefers relative, `Some(false)` forces absolute, and `None` reuses the
+    ///   container default.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after the reciprocal incoming record, outgoing metadata, and
+    /// materialized symbolic link are all installed while locks are held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkToError`] for key conflicts, missing targets, unavailable
+    /// target locks, broken existing state, persistence failures, or an
+    /// incomplete rollback reported as partial commit.
     pub fn link_to(
         &mut self,
         linker_key: &EntryKey,
@@ -303,6 +469,20 @@ impl LinkContainerWriteGuard {
 
     /// Removes an outgoing link and its reciprocal incoming-link record while
     /// retaining the linker write lock.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - Existing outgoing key to validate and remove.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal incoming metadata, local outgoing metadata,
+    /// and the symbolic link are removed while both required locks are held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnlinkToError`] when the link is absent, broken, unavailable,
+    /// cannot be persisted, or cannot be fully rolled back after failure.
     pub fn unlink_to(&mut self, linker_key: &EntryKey) -> std::result::Result<(), UnlinkToError> {
         let metadata = self.outgoing_metadata()?;
         let link = metadata
@@ -336,6 +516,26 @@ impl LinkContainerWriteGuard {
         Ok(())
     }
 
+    /// Copies one validated outgoing relationship to a new linker key.
+    ///
+    /// The copy preserves the source record's target UID, target key, and
+    /// relative-versus-absolute path representation.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Existing outgoing key whose relationship must validate.
+    /// * `to` - Unoccupied outgoing key to create.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after a second reciprocal incoming source, outgoing record,
+    /// and symbolic link are installed while locks are held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkToError`] for missing/broken source links, occupied
+    /// destination, unavailable targets, persistence failure, or partial
+    /// commit.
     pub fn link_copy(
         &mut self,
         from: &EntryKey,
@@ -376,6 +576,23 @@ impl LinkContainerWriteGuard {
         Ok(())
     }
 
+    /// Renames a validated outgoing link without changing its target or path policy.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Existing outgoing key to rename.
+    /// * `to` - Unoccupied destination outgoing key.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal metadata and both local outgoing key states
+    /// reflect the new key while locks remain held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source is absent/broken, the destination is
+    /// occupied, a target lock is unavailable, persistence fails, or rollback
+    /// cannot fully restore a consistent state.
     pub fn link_rename(&mut self, from: &EntryKey, to: &EntryKey) -> Result<()> {
         let metadata = self.outgoing_metadata()?;
         let link = metadata
@@ -453,6 +670,23 @@ impl LinkContainerWriteGuard {
         Ok(())
     }
 
+    /// Installs one outgoing symlink and its authoritative metadata record.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - New entry key in this link container.
+    /// * `target_key` - Ordinary entry key in the target container.
+    /// * `container_uid` - Verified persistent UID of the target container.
+    /// * `container_path` - Target root representation to persist, relative or absolute.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after both the symlink and outgoing metadata are installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkToError`] for invalid or occupied keys, conflicting records, filesystem or
+    /// metadata failure, or an incomplete rollback after metadata persistence fails.
     fn install_outgoing_link(
         &mut self,
         linker_key: &EntryKey,
@@ -502,6 +736,20 @@ impl LinkContainerWriteGuard {
         Ok(())
     }
 
+    /// Removes one outgoing symlink and its authoritative metadata record.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - Existing outgoing entry key to remove locally.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after the symlink, when present, and metadata record are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnlinkToError`] when the record is absent, the path holds a non-symlink, filesystem
+    /// or metadata work fails, or a removed symlink cannot be restored after persistence failure.
     fn remove_outgoing_link(
         &mut self,
         linker_key: &EntryKey,

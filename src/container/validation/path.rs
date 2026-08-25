@@ -1,3 +1,5 @@
+//! Recorded container-path, target-entry, and materialized-symlink validation.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -10,6 +12,21 @@ use super::super::{
 };
 use super::report::push_issue;
 
+/// Produces a comparable absolute path, canonicalizing it when possible.
+///
+/// # Arguments
+///
+/// * `path` - Container or entry path to normalize.
+///
+/// # Returns
+///
+/// The canonical path when it exists and is accessible, otherwise the absolute input unchanged or
+/// a relative input joined to the process working directory.
+///
+/// # Errors
+///
+/// Returns an error only when canonicalization failed, `path` is relative, and the current working
+/// directory cannot be read.
 pub(crate) fn normalized_path(path: &Path) -> Result<PathBuf> {
     if let Ok(path) = std::fs::canonicalize(path) {
         return Ok(path);
@@ -21,6 +38,16 @@ pub(crate) fn normalized_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Resolves an outgoing record's target-container path from its owner snapshot.
+///
+/// # Arguments
+///
+/// * `owner` - Snapshot of the link container that owns `outgoing`.
+/// * `outgoing` - Record containing an absolute or owner-relative target-container path.
+///
+/// # Returns
+///
+/// An absolute record unchanged, or the owner root joined with a relative record.
 pub(crate) fn resolved_recorded_path(
     owner: &ContainerLinkSnapshot,
     outgoing: &OutgoingLinkRecord,
@@ -32,6 +59,17 @@ pub(crate) fn resolved_recorded_path(
     }
 }
 
+/// Best-effort reads the UID of the container identified by an outgoing record's path.
+///
+/// # Arguments
+///
+/// * `owner` - Snapshot providing the base for a relative recorded path.
+/// * `outgoing` - Outgoing record whose target path should be inspected.
+///
+/// # Returns
+///
+/// `Some(uid)` when the resolved path opens and its UID is readable; otherwise `None`. Failures are
+/// intentionally suppressed because this helper only broadens mismatch detection.
 pub(crate) fn recorded_path_uid(
     owner: &ContainerLinkSnapshot,
     outgoing: &OutgoingLinkRecord,
@@ -42,6 +80,24 @@ pub(crate) fn recorded_path_uid(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Validates an outgoing record's target path, UID, and ordinary target entry.
+///
+/// # Arguments
+///
+/// * `owner` - Snapshot of the container owning `outgoing`, used to resolve relative paths.
+/// * `outgoing` - Outgoing record whose recorded path and target entry are checked.
+/// * `expected_uid` - UID required for the corresponding target container.
+/// * `expected_path` - Expected filesystem root of that target container.
+/// * `current` - Snapshot for the validation subject recorded in generated issues.
+/// * `current_key` - Subject entry key recorded in generated issues.
+/// * `corresponding_uid` - UID attributed to the peer in generated issues.
+/// * `corresponding_path` - Peer root attributed to generated issues.
+/// * `report` - Report receiving broken or temporarily unavailable results.
+///
+/// # Returns
+///
+/// `true` only when the recorded path opens the expected UID at `expected_path` and its target key
+/// resolves to an existing regular file; otherwise appends a report item and returns `false`.
 pub(crate) fn validate_recorded_container_path(
     owner: &ContainerLinkSnapshot,
     outgoing: &OutgoingLinkRecord,
@@ -184,6 +240,22 @@ pub(crate) fn validate_recorded_container_path(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Validates the filesystem symlink materialized for an outgoing record.
+///
+/// # Arguments
+///
+/// * `owner` - Snapshot whose root contains the materialized symlink and resolves target paths.
+/// * `outgoing` - Outgoing record used to derive the linker path and expected target text.
+/// * `current` - Snapshot for the validation subject recorded in generated issues.
+/// * `current_key` - Subject entry key recorded in generated issues.
+/// * `corresponding_uid` - UID attributed to the peer in generated issues.
+/// * `corresponding_path` - Peer root attributed to generated issues.
+/// * `report` - Report receiving mismatch, missing, or availability results.
+///
+/// # Returns
+///
+/// `true` only when the linker path is a symlink whose stored target exactly matches the record;
+/// otherwise appends a report item and returns `false`.
 pub(crate) fn validate_materialized_symlink(
     owner: &ContainerLinkSnapshot,
     outgoing: &OutgoingLinkRecord,
@@ -303,6 +375,16 @@ pub(crate) fn validate_materialized_symlink(
     }
 }
 
+/// Classifies a chained error as temporary for validation reporting.
+///
+/// # Arguments
+///
+/// * `error` - Arbitrary error whose complete source chain is inspected.
+///
+/// # Returns
+///
+/// `true` for container lock contention, explicit link unavailability, or transient I/O kinds;
+/// otherwise `false`.
 pub(crate) fn is_transient_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
@@ -315,6 +397,15 @@ pub(crate) fn is_transient_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Classifies an error that prevents obtaining a usable peer link snapshot.
+///
+/// # Arguments
+///
+/// * `error` - Snapshot error whose complete source chain is inspected.
+///
+/// # Returns
+///
+/// `true` for transient errors or link-metadata migration failures; otherwise `false`.
 pub(crate) fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
     is_transient_error(error)
         || error
@@ -322,6 +413,15 @@ pub(crate) fn is_unavailable_snapshot_error(error: &anyhow::Error) -> bool {
             .any(|cause| cause.downcast_ref::<LinkMetadataMigrationError>().is_some())
 }
 
+/// Classifies operating-system I/O kinds that may succeed on a later validation attempt.
+///
+/// # Arguments
+///
+/// * `kind` - Standard I/O error kind to classify.
+///
+/// # Returns
+///
+/// `true` for permission denial, would-block, interruption, or timeout; otherwise `false`.
 pub(crate) fn is_transient_io_kind(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,

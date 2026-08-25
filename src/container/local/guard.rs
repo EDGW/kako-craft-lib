@@ -1,21 +1,51 @@
+//! Local-container write guard and guarded entry/link-record mutations.
+
 use super::*;
 use crate::container::{ContainerLinkSnapshot, IncomingLinkRecord, LinkSource};
 
+/// Exclusive write guard for one local container.
+///
+/// The guard owns the advisory lock until dropped and implements ordinary
+/// entry mutation plus reciprocal incoming-link metadata operations through
+/// [`ContainerWriteGuard`].
 pub struct LocalContainerWriteGuard {
+    /// Root directory containing ordinary entry files.
     pub(super) root: PathBuf,
+    /// Full path of `.kcl/links.json` containing reciprocal incoming records.
     pub(super) links_path: PathBuf,
+    /// Stable container identity attached to guarded-operation tracing spans.
     pub(super) logger: ContainerLogger,
     // Keeping the descriptor alive keeps the OS-level advisory lock held.
     // The lock is automatically released on Drop and on process termination.
+    /// Open descriptor whose advisory lock remains owned for this guard's lifetime.
     pub(super) _lock_file: File,
 }
 
 impl LocalContainerWriteGuard {
+    /// Validates a key and resolves its ordinary-entry path.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Root-relative entry key to validate and join below this guard's root.
+    ///
+    /// # Returns
+    ///
+    /// The resolved entry path, or a clone of the invalid key.
     fn entry_path(&self, key: &EntryKey) -> std::result::Result<PathBuf, EntryKey> {
         validate_key(key)?;
         Ok(self.root.join(key))
     }
 
+    /// Loads incoming metadata and verifies its cached total record count.
+    ///
+    /// # Returns
+    ///
+    /// Parsed metadata, or empty current-version metadata when the file is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata cannot be read or migrated, or its `count` differs from the
+    /// number of stored source records.
     fn links(&self) -> Result<IncomingLinksMetadata> {
         if !self.links_path.exists() {
             return Ok(IncomingLinksMetadata::default());
@@ -33,6 +63,19 @@ impl LocalContainerWriteGuard {
         Ok(links)
     }
 
+    /// Recomputes the record count and atomically persists incoming metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `links` - Mutable metadata whose cached `count` is updated before serialization.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after `.kcl/links.json` is replaced with synchronized JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization or metadata persistence fails.
     fn save_links(&self, links: &mut IncomingLinksMetadata) -> Result<()> {
         links.count = links.links.values().map(Vec::len).sum::<usize>() as u64;
         #[cfg(test)]
@@ -42,6 +85,19 @@ impl LocalContainerWriteGuard {
         write_json_atomic(&self.links_path, links)
     }
 
+    /// Reports whether any incoming relationship protects an ordinary entry key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Target entry key to look up in incoming metadata.
+    ///
+    /// # Returns
+    ///
+    /// `true` when at least one source record is stored for `key`; otherwise `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if incoming metadata cannot be loaded or validated.
     fn is_linked_from(&self, key: &EntryKey) -> Result<bool> {
         Ok(self.links()?.links.contains_key(key))
     }

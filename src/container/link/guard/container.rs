@@ -1,3 +1,5 @@
+//! [`ContainerWriteGuard`] implementation for link containers.
+
 use super::*;
 use crate::container::{
     ContainerLinkSnapshot, OutgoingLinkRecord, apply_validation_check_action,

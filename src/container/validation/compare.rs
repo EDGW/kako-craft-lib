@@ -1,3 +1,5 @@
+//! Full-set comparison of current and corresponding container link records.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -11,12 +13,35 @@ use super::path::{
 };
 use super::report::{detect_duplicate_incoming, push_issue, push_match};
 
+/// Snapshot attempt and normalized identity for one supplied corresponding container.
 struct CorrespondingSnapshot {
+    /// Persistent UID read before acquiring the peer writer.
     uid: String,
+    /// Normalized filesystem root used in reports and duplicate-UID checks.
     path: PathBuf,
+    /// Link snapshot, or `None` when locking or metadata loading made the peer unavailable.
     snapshot: Option<ContainerLinkSnapshot>,
 }
 
+/// Validates all relationships involving one current key against explicitly supplied peers.
+///
+/// # Arguments
+///
+/// * `current` - Complete current-container snapshot whose records are the validation subject.
+/// * `key` - Current entry key; only incoming records targeting it and outgoing records using it are
+///   considered current relationships.
+/// * `corresponding` - Candidate peer containers. Unrelated records and containers are counted as
+///   ignored rather than treated as broken.
+///
+/// # Returns
+///
+/// A report separating exact matches, persistent inconsistencies, unavailable peers, and ignored
+/// records or containers.
+///
+/// # Errors
+///
+/// Returns [`LinkValidationRunError`] when the current container is supplied as its own peer,
+/// distinct supplied paths expose the same UID, or an unclassified container operation fails.
 pub(crate) fn validate_link_snapshots(
     current: &ContainerLinkSnapshot,
     key: &EntryKey,

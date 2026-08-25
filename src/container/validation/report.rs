@@ -1,3 +1,5 @@
+//! Validation-report construction, deduplication, ordering, and logging.
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -6,6 +8,16 @@ use super::super::{
     LinkValidationIssueKind, LinkValidationReport,
 };
 
+/// Appends every result category and ignored counter from one report into another.
+///
+/// # Arguments
+///
+/// * `into` - Destination report retained and mutated.
+/// * `other` - Source report consumed so its vectors can be appended without cloning.
+///
+/// # Returns
+///
+/// Returns after all vectors are appended and each ignored counter is added to `into`.
 pub(crate) fn merge_validation_report(
     into: &mut LinkValidationReport,
     mut other: LinkValidationReport,
@@ -18,6 +30,15 @@ pub(crate) fn merge_validation_report(
     into.ignored_containers += other.ignored_containers;
 }
 
+/// Sorts every validation result category into deterministic presentation order.
+///
+/// # Arguments
+///
+/// * `report` - Report whose valid, broken, and unavailable vectors are reordered in place.
+///
+/// # Returns
+///
+/// Returns after valid identities, ranked issues, and unavailable containers are sorted.
 pub(crate) fn sort_validation_report(report: &mut LinkValidationReport) {
     report.valid.sort_by(|left, right| {
         (
@@ -55,6 +76,15 @@ pub(crate) fn sort_validation_report(report: &mut LinkValidationReport) {
     });
 }
 
+/// Maps issue kinds to their stable report-order priority.
+///
+/// # Arguments
+///
+/// * `kind` - Validation issue category to rank.
+///
+/// # Returns
+///
+/// A lower number for issues displayed earlier in a sorted report.
 fn validation_issue_rank(kind: LinkValidationIssueKind) -> u8 {
     match kind {
         LinkValidationIssueKind::MissingOutgoingRecord => 0,
@@ -77,6 +107,18 @@ fn validation_issue_rank(kind: LinkValidationIssueKind) -> u8 {
     }
 }
 
+/// Emits a concise debug or warning summary for one validated entry key.
+///
+/// # Arguments
+///
+/// * `container_uid` - UID of the current container attached to structured log fields.
+/// * `key` - Current entry key attached to structured log fields.
+/// * `report` - Completed report whose counts determine level and message.
+///
+/// # Returns
+///
+/// Returns after emitting `debug` for a resolved report or `warn` when broken or unavailable items
+/// remain.
 pub(crate) fn log_validation_report(
     container_uid: &str,
     key: &EntryKey,
@@ -104,6 +146,24 @@ pub(crate) fn log_validation_report(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Appends one fully contextualized broken relationship to a report.
+///
+/// # Arguments
+///
+/// * `report` - Destination report whose `broken` vector receives the issue.
+/// * `kind` - Precise inconsistency category.
+/// * `current` - Current container snapshot supplying its UID.
+/// * `current_key` - Entry key being validated in the current container.
+/// * `corresponding_uid` - UID of the peer implicated by the issue.
+/// * `corresponding_path` - Filesystem root of that peer.
+/// * `linker_key` - Optional linker-side key when known.
+/// * `target_key` - Optional target-side key when known.
+/// * `expected` - Optional expected value rendered for diagnostics.
+/// * `actual` - Optional observed value rendered for diagnostics.
+///
+/// # Returns
+///
+/// Returns after cloning the supplied context into one new broken issue.
 pub(crate) fn push_issue(
     report: &mut LinkValidationReport,
     kind: LinkValidationIssueKind,
@@ -129,6 +189,21 @@ pub(crate) fn push_issue(
     });
 }
 
+/// Appends a valid reciprocal relationship only once per full identity tuple.
+///
+/// # Arguments
+///
+/// * `report` - Destination report whose `valid` vector may receive a match.
+/// * `seen` - Set of full `(linker UID, linker key, target UID, target key)` identities already
+///   emitted during this run.
+/// * `linker_uid` - Persistent UID of the outgoing-link owner.
+/// * `linker_key` - Entry key used by the outgoing link.
+/// * `target_uid` - Persistent UID of the target container.
+/// * `target_key` - Ordinary entry key in the target container.
+///
+/// # Returns
+///
+/// Returns after inserting a new identity and match, or without mutation when already present.
 pub(crate) fn push_match(
     report: &mut LinkValidationReport,
     seen: &mut BTreeSet<(String, String, String, String)>,
@@ -153,6 +228,20 @@ pub(crate) fn push_match(
     }
 }
 
+/// Reports duplicate incoming records within a relevant candidate set.
+///
+/// # Arguments
+///
+/// * `owner` - Current snapshot recorded as the validation subject.
+/// * `current_key` - Current entry key recorded in duplicate issues.
+/// * `corresponding_uid` - UID of the peer associated with the candidate records.
+/// * `corresponding_path` - Filesystem root of that peer.
+/// * `records` - Incoming records whose target/linker identity tuples are checked for repetition.
+/// * `report` - Destination report receiving one issue for every occurrence after the first.
+///
+/// # Returns
+///
+/// Returns after examining all records and appending duplicate issues.
 pub(crate) fn detect_duplicate_incoming(
     owner: &ContainerLinkSnapshot,
     current_key: &EntryKey,
