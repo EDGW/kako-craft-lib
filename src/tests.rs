@@ -1,3 +1,5 @@
+//! Crate-level tests for opening containers and shared logging behavior.
+
 use std::sync::Once;
 
 use tracing_subscriber::layer::SubscriberExt;
