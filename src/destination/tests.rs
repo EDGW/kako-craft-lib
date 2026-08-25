@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::{CatalogDestination, FakeDestination, Subcontainer};
+use super::{CatalogDestination, DestinationMember, FakeDestination, Subcontainer, list_members};
 use crate::container::{Container, LocalContainer};
 use crate::locator::{ContainerLocator, ContainerPath, resolve_container, resolve_subcontainer};
 
@@ -123,4 +123,58 @@ fn fake_destination_is_empty_but_opens_existing_container() {
             .unwrap(),
         container.uid().unwrap()
     );
+}
+
+#[test]
+fn generic_traversal_combines_member_kinds_and_recurses_on_request() {
+    let directory = TestDirectory::new();
+    let destination = CatalogDestination::new(directory.join("destination")).unwrap();
+    destination
+        .add_container("root", "local", None, false)
+        .unwrap();
+    destination
+        .add_container("group/nested/deep", "local", None, false)
+        .unwrap();
+
+    assert_eq!(
+        list_members(&destination, false)
+            .unwrap()
+            .into_iter()
+            .map(member_identity)
+            .collect::<Vec<_>>(),
+        vec!["subcontainer:group", "container:root"]
+    );
+    assert_eq!(
+        list_members(&destination, true)
+            .unwrap()
+            .into_iter()
+            .map(member_identity)
+            .collect::<Vec<_>>(),
+        vec![
+            "subcontainer:group",
+            "subcontainer:group/nested",
+            "container:group/nested/deep",
+            "container:root",
+        ]
+    );
+}
+
+/// Converts a tagged descriptor to a concise assertion value.
+///
+/// # Arguments
+///
+/// * `member` - Container or Subcontainer descriptor to identify.
+///
+/// # Returns
+///
+/// A `type:logical-path` string.
+fn member_identity(member: DestinationMember) -> String {
+    match member {
+        DestinationMember::Container(descriptor) => {
+            format!("container:{}", descriptor.logical_path)
+        }
+        DestinationMember::Subcontainer(descriptor) => {
+            format!("subcontainer:{}", descriptor.logical_path)
+        }
+    }
 }

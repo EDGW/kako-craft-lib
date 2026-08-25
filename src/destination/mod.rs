@@ -9,6 +9,7 @@ mod fake;
 pub mod minecraft;
 mod provider;
 mod traits;
+mod traversal;
 
 pub mod catalog;
 
@@ -19,6 +20,7 @@ pub use provider::{
     DestinationMetadata, DestinationProvider, DestinationRegistry, open_destination,
 };
 pub use traits::{Destination, Subcontainer};
+pub use traversal::list_members;
 
 #[cfg(test)]
 mod tests;
