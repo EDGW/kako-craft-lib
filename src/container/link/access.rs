@@ -73,6 +73,55 @@ pub(super) fn validate_outgoing_link_locked(
         container_path: container_path.clone(),
         reason: error.to_string(),
     })?;
+    let target_path = validate_outgoing_link_with_guard(
+        root,
+        key,
+        linker_uid,
+        link_path,
+        link,
+        target_guard.as_ref(),
+    )?;
+    Ok((target_guard, target_path))
+}
+
+/// Validates one outgoing record against an already locked target Container.
+///
+/// # Arguments
+///
+/// * `root` - Root of the link owner.
+/// * `key` - Outgoing linker key.
+/// * `linker_uid` - Stable UID of the link owner.
+/// * `link_path` - Materialized symlink path for `key`.
+/// * `link` - Authoritative outgoing metadata record.
+/// * `target_guard` - Already acquired target writer selected by a multi-lock transaction.
+///
+/// # Returns
+///
+/// The validated ordinary target-entry filesystem path.
+///
+/// # Errors
+///
+/// Returns [`LinkAccessError::Broken`] when target UID/key, reciprocal metadata,
+/// or the materialized symlink contradicts the outgoing record.
+pub(super) fn validate_outgoing_link_with_guard(
+    root: &Path,
+    key: &EntryKey,
+    linker_uid: &str,
+    link_path: &Path,
+    link: &OutgoingLink,
+    target_guard: &dyn ContainerWriteGuard,
+) -> std::result::Result<PathBuf, LinkAccessError> {
+    if target_guard.container_uid() != link.container_uid {
+        return Err(BrokenLinkError::new(
+            key,
+            format!(
+                "target container UID mismatch: recorded {}, found {}",
+                link.container_uid,
+                target_guard.container_uid()
+            ),
+        )
+        .into());
+    }
     let target_path = target_guard.filepath(&link.target_key).map_err(|error| {
         BrokenLinkError::new(
             key,
@@ -104,5 +153,5 @@ pub(super) fn validate_outgoing_link_locked(
     }
     verify_materialized_symlink(root, link_path, link, link.container_path.is_relative())
         .map_err(|error| BrokenLinkError::new(key, error.to_string()))?;
-    Ok((target_guard, target_path))
+    Ok(target_path)
 }

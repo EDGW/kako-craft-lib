@@ -150,6 +150,48 @@ impl LinkContainer {
         Self::from_local(local)
     }
 
+    /// Opens or initializes link-capable storage for another concrete kind.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Filesystem root to create or open.
+    /// * `logical_name` - Initial logical name used only for new metadata.
+    /// * `kind` - Concrete kind whose storage semantics include outgoing links.
+    ///
+    /// # Returns
+    ///
+    /// A link-capable handle retaining `kind` in common metadata and logging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local storage initialization or kind validation fails.
+    pub(crate) fn open_as(path: PathBuf, logical_name: String, kind: &'static str) -> Result<Self> {
+        Self::from_local(LocalContainer::open_as(path, logical_name, kind)?)
+    }
+
+    /// Wraps parsed common metadata for another link-capable concrete kind.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Filesystem root represented by `metadata`.
+    /// * `metadata` - Validated common metadata expected to declare `kind`.
+    /// * `kind` - Link-capable concrete kind required by the caller.
+    ///
+    /// # Returns
+    ///
+    /// A link-capable handle without reparsing common metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata or filesystem state does not match `kind`.
+    pub(crate) fn from_metadata_as(
+        path: PathBuf,
+        metadata: ContainerMetadata,
+        kind: &'static str,
+    ) -> Result<Self> {
+        Self::from_local(LocalContainer::from_metadata_as(path, metadata, kind)?)
+    }
+
     /// Returns the filesystem root of this link container.
     ///
     /// # Returns
@@ -277,7 +319,7 @@ impl LinkContainer {
     ///
     /// # Arguments
     ///
-    /// * `local` - Local-storage handle already validated with concrete kind `link`.
+    /// * `local` - Local-storage handle already validated with a link-capable concrete kind.
     ///
     /// # Returns
     ///
@@ -287,7 +329,13 @@ impl LinkContainer {
     ///
     /// Returns an error if the local storage UID cannot be read.
     fn from_local(local: LocalContainer) -> Result<Self> {
-        let logger = ContainerLogger::new("link", local.uid()?);
+        let kind = local.kind();
+        let kind = match kind.as_str() {
+            "link" => "link",
+            "configurable" => "configurable",
+            other => return Err(anyhow!("unsupported link-capable container kind: {other}")),
+        };
+        let logger = ContainerLogger::new(kind, local.uid()?);
         debug!(
             logger = %logger.name(),
             container_uid = %logger.uid(),
@@ -387,7 +435,7 @@ impl Container for LinkContainer {
         let span = container_operation_span!(self.logger, "kind");
         let _entered = span.enter();
         trace!("getting container kind");
-        "link".to_owned()
+        self.local.kind()
     }
 
     fn list(&self) -> Result<Vec<EntryKey>> {

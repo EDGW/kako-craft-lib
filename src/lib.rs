@@ -12,6 +12,7 @@
 
 pub mod container;
 pub mod destination;
+pub mod locator;
 
 mod logging;
 

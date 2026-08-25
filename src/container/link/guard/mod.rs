@@ -427,10 +427,6 @@ impl LinkContainerWriteGuard {
         debug!(linker_key = %linker_key, target_key = %target_key, "creating outgoing link");
         let target_uid = target.uid()?;
         let target_root = absolute_path(&target.root_path())?;
-        let metadata = self.outgoing_metadata()?;
-        let prefer_relative = prefer_relative.unwrap_or(metadata.prefer_relative);
-        let container_path =
-            recorded_container_path(&absolute_path(&self.root)?, &target_root, prefer_relative);
         let mut target_guard = target.writer().map_err(|error| {
             LinkAccessError::Unavailable(LinkUnavailableError {
                 key: linker_key.clone(),
@@ -439,6 +435,50 @@ impl LinkContainerWriteGuard {
                 reason: error.to_string(),
             })
         })?;
+        self.link_to_locked(
+            linker_key,
+            &target_root,
+            target_guard.as_mut(),
+            target_key,
+            prefer_relative,
+        )
+    }
+
+    /// Creates an outgoing relationship using an already acquired target writer.
+    ///
+    /// This entry point lets a higher-level transaction acquire source and target
+    /// locks in a stable order without asking this guard to lock the target again.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - New outgoing key in this locked link-capable Container.
+    /// * `target_root` - Filesystem root represented by `target_guard`.
+    /// * `target_guard` - Already locked target Container writer.
+    /// * `target_key` - Existing ordinary target entry.
+    /// * `prefer_relative` - Per-link path override, or `None` for this Container's default.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal metadata, outgoing metadata, and symlink are installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkToError`] for missing/conflicting targets, metadata or
+    /// filesystem failures, or incomplete rollback.
+    pub fn link_to_locked(
+        &mut self,
+        linker_key: &EntryKey,
+        target_root: &Path,
+        target_guard: &mut dyn ContainerWriteGuard,
+        target_key: &EntryKey,
+        prefer_relative: Option<bool>,
+    ) -> std::result::Result<(), LinkToError> {
+        let target_uid = target_guard.container_uid().to_owned();
+        let target_root = absolute_path(target_root)?;
+        let metadata = self.outgoing_metadata()?;
+        let prefer_relative = prefer_relative.unwrap_or(metadata.prefer_relative);
+        let container_path =
+            recorded_container_path(&absolute_path(&self.root)?, &target_root, prefer_relative);
         let target_filename = absolute_path(&target_guard.filepath(target_key)?)?;
         if !target_filename.is_file() {
             return Err(LinkToError::TargetNotFound(target_key.clone()));
@@ -493,6 +533,43 @@ impl LinkContainerWriteGuard {
         let link_path = self.entry_path(linker_key)?;
         let (mut target_guard, _) =
             validate_outgoing_link_locked(&self.root, linker_key, &self.uid, &link_path, &link)?;
+        self.unlink_to_locked(linker_key, target_guard.as_mut())
+    }
+
+    /// Removes an outgoing relationship using an already acquired target writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - Existing outgoing key in this locked Container.
+    /// * `target_guard` - Already locked target writer selected from the outgoing record.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal and local outgoing state are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnlinkToError`] when the record is absent or broken, target
+    /// state mismatches, persistence fails, or rollback is incomplete.
+    pub fn unlink_to_locked(
+        &mut self,
+        linker_key: &EntryKey,
+        target_guard: &mut dyn ContainerWriteGuard,
+    ) -> std::result::Result<(), UnlinkToError> {
+        let metadata = self.outgoing_metadata()?;
+        let link = metadata
+            .links
+            .get(linker_key)
+            .cloned()
+            .ok_or(UnlinkToError::LinkNotFound)?;
+        super::access::validate_outgoing_link_with_guard(
+            &self.root,
+            linker_key,
+            &self.uid,
+            &self.entry_path(linker_key)?,
+            &link,
+            target_guard,
+        )?;
         target_guard.unlink(&self.uid, &link.target_key, linker_key)?;
         let result = self.remove_outgoing_link(linker_key);
         if let Err(error) = result {
@@ -513,6 +590,47 @@ impl LinkContainerWriteGuard {
             return Err(error);
         }
         info!(linker_key = %linker_key, target_key = %link.target_key, "removed outgoing link");
+        Ok(())
+    }
+
+    /// Validates one outgoing relationship against an already locked target writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `linker_key` - Existing outgoing key in this locked link-capable Container.
+    /// * `target_guard` - Already acquired target writer selected by the outgoing record.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` only when target UID/key, reciprocal metadata, and symlink all match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkAccessError::Broken`] when any persistent relationship state mismatches,
+    /// or [`LinkAccessError::Unavailable`] only if validation delegated by a target implementation
+    /// reports temporary unavailability.
+    pub fn validate_outgoing_locked(
+        &self,
+        linker_key: &EntryKey,
+        target_guard: &dyn ContainerWriteGuard,
+    ) -> std::result::Result<(), LinkAccessError> {
+        let metadata = self
+            .outgoing_metadata()
+            .map_err(|error| BrokenLinkError::new(linker_key, error.to_string()))?;
+        let link = metadata
+            .links
+            .get(linker_key)
+            .ok_or_else(|| BrokenLinkError::new(linker_key, "outgoing link metadata is missing"))?;
+        super::access::validate_outgoing_link_with_guard(
+            &self.root,
+            linker_key,
+            &self.uid,
+            &self
+                .entry_path(linker_key)
+                .map_err(|error| BrokenLinkError::new(linker_key, error.to_string()))?,
+            link,
+            target_guard,
+        )?;
         Ok(())
     }
 
@@ -550,6 +668,45 @@ impl LinkContainerWriteGuard {
         let link_path = self.entry_path(from).map_err(LinkToError::Other)?;
         let (mut target_guard, _) =
             validate_outgoing_link_locked(&self.root, from, &self.uid, &link_path, &link)?;
+        self.link_copy_locked(from, to, target_guard.as_mut())
+    }
+
+    /// Copies an outgoing relationship using an already acquired target writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Existing outgoing key to validate and copy.
+    /// * `to` - Unoccupied outgoing destination key.
+    /// * `target_guard` - Already locked target writer selected by the source record.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal and outgoing state contains the additional key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkToError`] for broken source state, conflicts, persistence
+    /// failures, or incomplete rollback.
+    pub fn link_copy_locked(
+        &mut self,
+        from: &EntryKey,
+        to: &EntryKey,
+        target_guard: &mut dyn ContainerWriteGuard,
+    ) -> std::result::Result<(), LinkToError> {
+        let metadata = self.outgoing_metadata().map_err(LinkToError::Other)?;
+        let link = metadata
+            .links
+            .get(from)
+            .cloned()
+            .ok_or_else(|| LinkToError::TargetNotFound(from.clone()))?;
+        super::access::validate_outgoing_link_with_guard(
+            &self.root,
+            from,
+            &self.uid,
+            &self.entry_path(from).map_err(LinkToError::Other)?,
+            &link,
+            target_guard,
+        )?;
         target_guard.link_from(&self.uid, &link.target_key, to)?;
         let result = self.install_outgoing_link(
             to,
@@ -609,6 +766,49 @@ impl LinkContainerWriteGuard {
             &self.uid,
             &self.entry_path(from)?,
             &link,
+        )
+        .map_err(LinkAccessError::into_anyhow)?;
+        self.link_rename_locked(from, to, target_guard.as_mut())
+    }
+
+    /// Renames an outgoing relationship using an already acquired target writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Existing outgoing key.
+    /// * `to` - Unoccupied replacement key.
+    /// * `target_guard` - Already locked target writer selected by the source record.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after reciprocal and local outgoing state use `to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for broken state, conflicts, persistence failures, or
+    /// incomplete rollback.
+    pub fn link_rename_locked(
+        &mut self,
+        from: &EntryKey,
+        to: &EntryKey,
+        target_guard: &mut dyn ContainerWriteGuard,
+    ) -> Result<()> {
+        let metadata = self.outgoing_metadata()?;
+        let link = metadata
+            .links
+            .get(from)
+            .cloned()
+            .ok_or_else(|| anyhow!("outgoing link does not exist: {from}"))?;
+        if from == to {
+            return Ok(());
+        }
+        super::access::validate_outgoing_link_with_guard(
+            &self.root,
+            from,
+            &self.uid,
+            &self.entry_path(from)?,
+            &link,
+            target_guard,
         )
         .map_err(LinkAccessError::into_anyhow)?;
         if self.outgoing_metadata()?.links.contains_key(to)

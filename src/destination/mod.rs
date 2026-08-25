@@ -1,48 +1,23 @@
-//! Destination abstractions for mapping logical names to container roots.
+//! Explicit Destination catalogs and logical Container/Subcontainer traversal.
 //!
-//! A destination owns a filesystem namespace and exposes containers through
-//! stable string indexes. Concrete destinations decide how an index maps to a
-//! path; [`mc`] implements the standard Minecraft directory layout.
+//! A Destination is a filesystem-rooted catalog, not a Container. Its catalog
+//! exposes only declared members; unrelated directories are never discovered
+//! as managed Containers.
 
-use anyhow::Result;
+mod descriptor;
+mod fake;
+mod provider;
+mod traits;
 
-use crate::container::Container;
+pub mod catalog;
 
-pub mod mc;
-pub use mc::McDestination;
-
-/// Maps logical container indexes to concrete container handles.
-pub trait Destination {
-    /// Lists the container indexes currently discoverable in this destination.
-    ///
-    /// # Returns
-    ///
-    /// A deterministic, lexically sorted list of logical container indexes. The
-    /// indexes are suitable for passing to [`Self::open`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the destination root or one of its required
-    /// directories cannot be inspected.
-    fn list(&self) -> Result<Vec<String>>;
-
-    /// Opens or initializes the container identified by a logical index.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Destination-specific logical index returned by [`Self::list`].
-    ///
-    /// # Returns
-    ///
-    /// A boxed container handle rooted at the path represented by `name`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `name` is malformed or addresses a path outside
-    /// the destination namespace, or when the concrete container cannot be
-    /// opened or initialized.
-    fn open(&self, name: &str) -> Result<Box<dyn Container>>;
-}
+pub use catalog::{CatalogDestination, CatalogDestinationProvider};
+pub use descriptor::{ContainerDescriptor, DestinationMember, SubcontainerDescriptor};
+pub use fake::FakeDestination;
+pub use provider::{
+    DestinationMetadata, DestinationProvider, DestinationRegistry, open_destination,
+};
+pub use traits::{Destination, Subcontainer};
 
 #[cfg(test)]
 mod tests;

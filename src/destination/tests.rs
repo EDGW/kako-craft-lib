@@ -1,80 +1,126 @@
-//! Tests for Minecraft destination index discovery and path safety.
+//! Focused explicit-catalog and FakeDestination lifecycle tests.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
-use super::{Destination, mc::McDestination};
+use uuid::Uuid;
 
-#[test]
-fn lists_root_and_version_mod_containers() {
-    let root = tempfile_root();
-    fs::create_dir(root.join("libraries")).unwrap();
-    fs::create_dir(root.join("assets")).unwrap();
-    fs::create_dir_all(root.join("versions/1.19.2/mods")).unwrap();
-    fs::create_dir(root.join("versions/1.20.1")).unwrap();
+use super::{CatalogDestination, FakeDestination, Subcontainer};
+use crate::container::{Container, LocalContainer};
+use crate::locator::{ContainerLocator, ContainerPath, resolve_container, resolve_subcontainer};
 
-    let destination = McDestination::new(&root).unwrap();
-    assert_eq!(
-        destination.list().unwrap(),
-        vec![
-            "assets".to_owned(),
-            "libraries".to_owned(),
-            "versions:1.19.2:mods".to_owned()
-        ]
-    );
+/// Isolated filesystem root removed when each test scope ends.
+struct TestDirectory {
+    /// Unique directory below the process temporary directory.
+    path: PathBuf,
 }
 
-#[test]
-fn opens_missing_standard_container_and_indexes_version_path() {
-    let root = tempfile_root();
-    let destination = McDestination::new(&root).unwrap();
-    let libraries = destination.open("libraries").unwrap();
-    assert_eq!(libraries.root_path(), root.join("libraries"));
-    assert!(root.join("libraries/.kcl/container.json").is_file());
+impl TestDirectory {
+    /// Creates one unique empty test root.
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "kako-destination-test-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&path).expect("failed to create isolated test directory");
+        Self { path }
+    }
 
-    let mods = destination.open("versions:1.19.2:mods").unwrap();
-    assert_eq!(mods.root_path(), root.join("versions/1.19.2/mods"));
-    assert!(
-        destination
-            .list()
-            .unwrap()
-            .contains(&"versions:1.19.2:mods".to_owned())
-    );
+    /// Joins one relative path below the test root.
+    fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.path.join(path)
+    }
+
+    /// Returns the test root.
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
-#[test]
-fn rejects_unsafe_or_unsupported_indexes() {
-    let root = tempfile_root();
-    let destination = McDestination::new(&root).unwrap();
-    for index in [
-        "",
-        "../outside",
-        ".kcl",
-        "versions",
-        "versions:1.19.2:assets",
-        "versions::mods",
-        "versions:../bad:mods",
-        "versions:1.19.2:mods:extra",
-    ] {
-        assert!(
-            destination.container_path(index).is_err(),
-            "accepted {index:?}"
-        );
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!(
+                "failed to remove test directory {}: {error}",
+                self.path.display()
+            );
+        }
     }
 }
 
 #[test]
-fn rejects_non_directory_minecraft_root() {
-    let root = tempfile_root().join("file");
-    fs::write(&root, b"not a directory").unwrap();
-    assert!(McDestination::new(root).is_err());
+fn catalog_enumerates_only_declared_members_and_resolves_paths() {
+    let directory = TestDirectory::new();
+    let destination = CatalogDestination::new(directory.join("destination")).unwrap();
+    fs::create_dir_all(directory.join("destination/unknown")).unwrap();
+    destination
+        .add_container("cache", "local", None, false)
+        .unwrap();
+    destination
+        .add_container("versions/one", "local", None, false)
+        .unwrap();
+    destination.add_subcontainer("cache", true).unwrap();
+
+    assert_eq!(
+        destination
+            .containers()
+            .unwrap()
+            .into_iter()
+            .map(|member| member.name)
+            .collect::<Vec<_>>(),
+        vec!["cache"]
+    );
+    assert_eq!(
+        destination
+            .subcontainers()
+            .unwrap()
+            .into_iter()
+            .map(|member| member.name)
+            .collect::<Vec<_>>(),
+        vec!["cache", "versions"]
+    );
+    let locator: ContainerLocator =
+        format!("{}:versions/one", directory.join("destination").display())
+            .parse()
+            .unwrap();
+    let opened = resolve_container(&locator, directory.path()).unwrap();
+    assert_eq!(opened.kind(), "local");
+    let repeated_separator: ContainerLocator =
+        format!("{}:versions//one", directory.join("destination").display())
+            .parse()
+            .unwrap();
+    assert!(resolve_container(&repeated_separator, directory.path()).is_err());
+    let cache_path = ContainerPath::new("cache/").unwrap();
+    assert!(resolve_subcontainer(&destination, Some(&cache_path)).is_ok());
+    assert!(
+        directory
+            .join("destination/versions/one/.kcl/container.json")
+            .is_file()
+    );
 }
 
-fn tempfile_root() -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "kako-mc-destination-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    root
+#[test]
+fn fake_destination_is_empty_but_opens_existing_container() {
+    let directory = TestDirectory::new();
+    let container = LocalContainer::new(directory.join("plain")).unwrap();
+    let fake = FakeDestination::new(directory.path());
+    assert!(fake.containers().unwrap().is_empty());
+    assert!(fake.subcontainers().unwrap().is_empty());
+    let nested = fake.open_subcontainer("plain").unwrap();
+    assert!(nested.containers().unwrap().is_empty());
+    assert_eq!(
+        fake.open_container("plain").unwrap().uid().unwrap(),
+        container.uid().unwrap()
+    );
+    let locator: ContainerLocator = ":plain".parse().unwrap();
+    assert_eq!(
+        resolve_container(&locator, directory.path())
+            .unwrap()
+            .uid()
+            .unwrap(),
+        container.uid().unwrap()
+    );
 }

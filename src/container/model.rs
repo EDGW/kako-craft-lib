@@ -269,7 +269,7 @@ pub struct ContainerMetadata {
     pub uid: String,
     /// User-facing name associated with the container.
     pub logical_name: String,
-    /// Concrete container implementation kind, currently `local` or `link`.
+    /// Concrete container implementation kind: `local`, `link`, or `configurable`.
     pub kind: String,
 }
 
