@@ -129,6 +129,33 @@ impl ConfigurableContainer {
         self.writer()?.set_rules(rules)
     }
 
+    /// Validates every persisted routing rule against its currently resolved target UID.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when rule syntax, target locators, and all recorded target UIDs
+    /// still agree with the opened Containers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rule metadata is malformed, a target cannot be
+    /// resolved relative to this Container, or a target UID has changed.
+    pub fn validate_rule_targets(&self) -> Result<()> {
+        let rules = metadata::load_rules(&rules_path(self.path()))?;
+        let source_uid = self.uid()?;
+        for rule in rules.matches {
+            let target = transaction::resolve_target(
+                self.path(),
+                &rule.container.locator,
+                &rule.container.uid,
+            )?;
+            if target.uid == source_uid {
+                anyhow::bail!("a ConfigurableContainer rule cannot target itself");
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the automatic storage preference for one key without writing data.
     ///
     /// # Arguments

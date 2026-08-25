@@ -11,6 +11,7 @@ use crate::container::CONTROL_DIR;
 
 use super::Destination;
 use super::catalog::CatalogDestinationProvider;
+use super::minecraft::McDestinationProvider;
 
 /// Current `.kcl/destination.json` schema version.
 pub const DESTINATION_FORMAT_VERSION: u32 = 1;
@@ -95,17 +96,20 @@ pub struct DestinationRegistry {
 impl Default for DestinationRegistry {
     fn default() -> Self {
         Self {
-            providers: vec![Box::new(CatalogDestinationProvider)],
+            providers: vec![
+                Box::new(CatalogDestinationProvider),
+                Box::new(McDestinationProvider),
+            ],
         }
     }
 }
 
 impl DestinationRegistry {
-    /// Creates the standard stage-one registry.
+    /// Creates the standard registry with generic catalog and Minecraft providers.
     ///
     /// # Returns
     ///
-    /// A registry containing the explicit catalog provider.
+    /// A registry containing the built-in explicit-catalog and Minecraft providers.
     pub fn new() -> Self {
         Self::default()
     }

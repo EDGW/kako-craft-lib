@@ -6,6 +6,7 @@
 
 mod descriptor;
 mod fake;
+pub mod minecraft;
 mod provider;
 mod traits;
 
