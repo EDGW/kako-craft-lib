@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 
 use super::{
-    CONTAINER_FORMAT_VERSION, CONTAINER_METADATA_FILE, CONTROL_DIR, Container, ContainerMetadata,
-    LinkContainer, LocalContainer,
+    CONTAINER_FORMAT_VERSION, CONTAINER_METADATA_FILE, CONTROL_DIR, ConfigurableContainer,
+    Container, ContainerMetadata, LinkContainer, LocalContainer,
 };
 
 impl ContainerMetadata {
@@ -83,7 +83,8 @@ impl ContainerMetadata {
     ///
     /// # Returns
     ///
-    /// A boxed [`LocalContainer`] or [`LinkContainer`] exposed as
+    /// A boxed [`LocalContainer`], [`LinkContainer`], or
+    /// [`ConfigurableContainer`] exposed as
     /// [`dyn Container`](Container).
     ///
     /// # Errors
@@ -97,6 +98,7 @@ impl ContainerMetadata {
         match self.kind.as_str() {
             "local" => Ok(Box::new(LocalContainer::from_metadata(path, self)?)),
             "link" => Ok(Box::new(LinkContainer::from_metadata(path, self)?)),
+            "configurable" => Ok(Box::new(ConfigurableContainer::from_metadata(path, self)?)),
             kind => Err(anyhow!("unsupported container kind: {kind}")),
         }
     }

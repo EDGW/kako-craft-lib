@@ -17,6 +17,7 @@ macro_rules! container_operation_span {
 }
 
 mod check;
+pub mod configurable;
 mod error;
 pub mod link;
 pub mod local;
@@ -27,6 +28,10 @@ mod traits;
 mod validation;
 
 pub(crate) use check::{apply_validation_check_action, validation_check_issues};
+pub use configurable::{
+    ConfigRule, ConfigRuleTarget, ConfigurableContainer, ForcedStorageWarning, RouteDecision,
+    StorageClass,
+};
 pub use error::*;
 pub use link::{LinkContainer, LinkContainerWriteGuard};
 pub use local::LocalContainer;
